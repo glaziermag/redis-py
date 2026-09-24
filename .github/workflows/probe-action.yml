@@ -1,0 +1,39 @@
+name: probe-action
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: 'unused'
+        default: ''
+env:
+  CURRENT_REDIS_VERSION: '8.8.0'
+  REDIS_VERSION_CUSTOM_MAP: >-
+    8.10:8.10.0
+  COVERAGE_CORE: sysmon
+jobs:
+  cell:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { redis: '8.10', python: '3.14', config: '3-unified_responses-standalone', n: 1 }
+          - { redis: '8.10', python: '3.14', config: '3-unified_responses-standalone', n: 2 }
+          - { redis: '8.10', python: '3.14', config: '3-unified_responses-standalone', n: 3 }
+          - { redis: '8.10', python: '3.14', config: '3-unified_responses-standalone', n: 4 }
+          - { redis: '8.10', python: '3.14', config: 'default-unified_responses-standalone', n: 1 }
+          - { redis: '8.10', python: '3.14', config: 'default-unified_responses-standalone', n: 2 }
+          - { redis: '8.10', python: '3.10', config: '3-unified_responses-standalone', n: 1 }
+          - { redis: '8.8.0', python: '3.14', config: '3-unified_responses-standalone', n: 1 }
+    name: Redis ${{ matrix.redis }}; Python ${{ matrix.python }}; ${{ matrix.config }} #${{ matrix.n }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run tests (project composite action, nightly-identical inputs)
+        uses: ./.github/actions/run-tests
+        with:
+          python-version: ${{ matrix.python }}
+          parser-backend: plain
+          redis-version: ${{ matrix.redis }}
+          event-loop: asyncio
+          test-config: ${{ matrix.config }}
