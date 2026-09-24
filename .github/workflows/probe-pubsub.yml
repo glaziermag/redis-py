@@ -1,0 +1,64 @@
+name: probe-pubsub
+on:
+  workflow_dispatch:
+    inputs:
+      passes:
+        description: 'pytest passes over tests/test_asyncio/test_pubsub.py per cell'
+        default: '6'
+      extra:
+        description: 'extra pytest args'
+        default: ''
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { redis: '8.10.0', python: '3.14', protocol: '3', legacy: 'false', label: 'r8.10-py3.14-resp3-unified' }
+          - { redis: '8.10.0', python: '3.10', protocol: '3', legacy: 'false', label: 'r8.10-py3.10-resp3-unified' }
+          - { redis: '8.8.0',  python: '3.14', protocol: '3', legacy: 'false', label: 'r8.8-py3.14-resp3-unified' }
+          - { redis: '8.10.0', python: '3.14', protocol: '3', legacy: 'true',  label: 'r8.10-py3.14-resp3-legacy' }
+    name: ${{ matrix.label }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: 'pip'
+      - name: Setup test environment (mirrors .github/actions/run-tests)
+        env:
+          CLIENT_LIBS_TEST_IMAGE_TAG: ${{ matrix.redis }}
+          CLIENT_LIBS_TEST_STACK_IMAGE_TAG: ${{ matrix.redis }}
+        run: |
+          set -e
+          pip install -r dev_requirements.txt
+          pip uninstall -y redis
+          pip install -e .[jwt]
+          invoke devenv --endpoints all
+          sleep 10
+          docker ps --format '{{.Names}} {{.Image}} {{.Status}}'
+      - name: Probe
+        run: |
+          set +e
+          fails=0
+          for i in $(seq 1 ${{ inputs.passes }}); do
+            echo "::group::pass $i"
+            pytest --protocol=${{ matrix.protocol }} --legacy-responses=${{ matrix.legacy }} --redis-mod-url=redis://127.0.0.1:6379 \
+              -m 'not onlycluster and not fixed_client and not multidb_integration' \
+              -p no:cacheprovider --no-cov -q -rf --tb=short ${{ inputs.extra }} tests/test_asyncio/test_pubsub.py 2>&1 | tee pass_$i.log | tail -n 25
+            rc=${PIPESTATUS[0]}
+            echo "PASS_RESULT $i rc=$rc $(grep -E '^[0-9]+ (passed|failed)|^= .* in [0-9.]+s' pass_$i.log | tail -1)"
+            grep -h '^FAILED' pass_$i.log | sed "s/^/PASS $i /"
+            [ "$rc" != "0" ] && fails=$((fails+1))
+            echo "::endgroup::"
+          done
+          echo "SUMMARY ${{ matrix.label }}: $fails of ${{ inputs.passes }} passes had failures"
+          grep -h '^FAILED' pass_*.log | sed 's/ - .*//' | sort | uniq -c | sort -rn
+          exit 0
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: probe-${{ matrix.label }}
+          path: pass_*.log
