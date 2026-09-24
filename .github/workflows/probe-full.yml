@@ -1,0 +1,57 @@
+name: probe-full
+on:
+  workflow_dispatch:
+    inputs:
+      cells:
+        description: 'unused'
+        default: ''
+jobs:
+  full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { redis: '8.10.0', python: '3.14', legacy: 'false', n: 1 }
+          - { redis: '8.10.0', python: '3.14', legacy: 'false', n: 2 }
+          - { redis: '8.10.0', python: '3.14', legacy: 'false', n: 3 }
+          - { redis: '8.10.0', python: '3.14', legacy: 'false', n: 4 }
+          - { redis: '8.10.0', python: '3.14', legacy: 'false', n: 5 }
+          - { redis: '8.10.0', python: '3.14', legacy: 'false', n: 6 }
+          - { redis: '8.10.0', python: '3.10', legacy: 'false', n: 1 }
+          - { redis: '8.10.0', python: '3.10', legacy: 'false', n: 2 }
+    name: r${{ matrix.redis }}-py${{ matrix.python }}-legacy${{ matrix.legacy }}-${{ matrix.n }}
+    env:
+      COVERAGE_CORE: sysmon
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+          cache: 'pip'
+      - name: Setup test environment (mirrors .github/actions/run-tests)
+        env:
+          CLIENT_LIBS_TEST_IMAGE_TAG: ${{ matrix.redis }}
+          CLIENT_LIBS_TEST_STACK_IMAGE_TAG: ${{ matrix.redis }}
+        run: |
+          set -e
+          pip install -r dev_requirements.txt
+          pip uninstall -y redis
+          pip install -e .[jwt]
+          invoke devenv --endpoints all
+          sleep 10
+      - name: Full standalone suite (same pytest line as tasks.py standalone_tests)
+        run: |
+          set +e
+          mkdir -p junit-results
+          pytest --protocol=3 --legacy-responses=${{ matrix.legacy }} --redis-mod-url=redis://127.0.0.1:6379 --ignore=tests/test_scenario --ignore=tests/test_asyncio/test_scenario --cov=./ --cov-report=xml:coverage_probe.xml -m 'not onlycluster and not fixed_client and not multidb_integration' --junit-xml=junit-results/standalone-probe.xml -rf --tb=short 2>&1 | tee full.log | grep -E "STALLPROBE|FAILED|passed|failed" 
+          echo "RESULT rc=${PIPESTATUS[0]}"
+          exit 0
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: full-r${{ matrix.redis }}-py${{ matrix.python }}-legacy${{ matrix.legacy }}-${{ matrix.n }}
+          path: |
+            full.log
+            junit-results/*.xml
