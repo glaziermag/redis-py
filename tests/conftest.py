@@ -1003,3 +1003,74 @@ def pytest_sessionfinish(session, exitstatus):
     )
     for t, g, d, ts, c in big:
         print(f"STALLPROBE GC gen={g} {d * 1000:.0f}ms collected={c} during {t}")
+    try:
+        cli = _srv_client()
+        if cli:
+            print(f"STALLPROBE server-final LATENCY LATEST={cli.execute_command('LATENCY', 'LATEST')} "
+                  f"total_forks={cli.info('stats').get('total_forks')} "
+                  f"persistence={{k: v for k, v in cli.info('persistence').items() if 'rdb' in k or 'aof_enabled' in k or 'fork' in k}}")
+    except Exception as e:
+        print(f"STALLPROBE sessionfinish server error: {e}")
+
+
+# ---- STALLPROBE server-side: Redis latency monitor + fork/save attribution per test ----
+import redis as _redis_mod
+
+_SRV = {"client": None, "forks": None, "lat": None, "events": []}
+
+
+def _srv_client():
+    if _SRV["client"] is None:
+        try:
+            c = _redis_mod.Redis(host="localhost", port=6379, socket_timeout=2)
+            c.ping()
+            _SRV["client"] = c
+        except Exception as e:  # pragma: no cover
+            print(f"STALLPROBE server probe unavailable: {e}")
+            _SRV["client"] = False
+    return _SRV["client"] or None
+
+
+def _srv_snapshot(c):
+    info = c.info("stats")
+    lat = {k.decode() if isinstance(k, bytes) else k: v for k, v in
+           ((e[0], (e[1], e[2], e[3])) for e in c.execute_command("LATENCY", "LATEST"))}
+    return info.get("total_forks"), lat
+
+
+def pytest_sessionstart(session):
+    c = _srv_client()
+    if not c:
+        return
+    try:
+        c.config_set("latency-monitor-threshold", 20)
+        srv = c.info("server")
+        pers = c.info("persistence")
+        print(
+            f"STALLPROBE server redis_version={srv.get('redis_version')} io_threads_active={srv.get('io_threads_active')} "
+            f"save={c.config_get('save')} appendonly={c.config_get('appendonly')} "
+            f"rdb_changes_since_last_save={pers.get('rdb_changes_since_last_save')} total_forks={c.info('stats').get('total_forks')}"
+        )
+        _SRV["forks"], _SRV["lat"] = _srv_snapshot(c)
+    except Exception as e:
+        print(f"STALLPROBE sessionstart error: {e}")
+
+
+def pytest_runtest_teardown(item, nextitem):
+    c = _srv_client()
+    if not c:
+        return
+    try:
+        forks, lat = _srv_snapshot(c)
+        if _SRV["forks"] is not None and forks != _SRV["forks"]:
+            pers = c.info("persistence")
+            print(
+                f"STALLPROBE FORK total_forks {_SRV['forks']}->{forks} rdb_last_bgsave_time_sec={pers.get('rdb_last_bgsave_time_sec')} "
+                f"rdb_last_save_time={pers.get('rdb_last_save_time')} during {item.nodeid}"
+            )
+        new = {k: v for k, v in lat.items() if _SRV["lat"] is not None and _SRV["lat"].get(k) != v}
+        if new:
+            print(f"STALLPROBE LATENCY {new} during {item.nodeid}")
+        _SRV["forks"], _SRV["lat"] = forks, lat
+    except Exception as e:
+        print(f"STALLPROBE teardown error: {e}")
