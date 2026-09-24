@@ -64,16 +64,40 @@ def with_timeout(t):
 
 
 async def wait_for_message(pubsub, timeout=0.2, ignore_subscribe_messages=False):
-    now = asyncio.get_running_loop().time()
+    # STALLPROBE: identical loop, plus per-poll gap and GC-pause attribution
+    from tests.conftest import STALL_GC, STALL_CUR
+    import gc as _gc
+    loop = asyncio.get_running_loop()
+    t_start = loop.time()
+    now = t_start
     timeout = now + timeout
+    polls = []
+    n_gc0 = len(STALL_GC)
+    stats0 = _gc.get_stats()
     while now < timeout:
+        t_poll = loop.time()
         message = await pubsub.get_message(
             ignore_subscribe_messages=ignore_subscribe_messages
         )
+        polls.append(round(loop.time() - t_poll, 4))
         if message is not None:
+            if loop.time() - t_start > 0.1:
+                print(
+                    f"STALLPROBE slow-wait {loop.time() - t_start:.3f}s polls={len(polls)} "
+                    f"maxpoll={max(polls):.3f} gc_during={STALL_GC[n_gc0:]} "
+                    f"gc_stats_delta={[(b['collections'] - a['collections']) for a, b in zip(stats0, _gc.get_stats())]} "
+                    f"test={STALL_CUR['test']}"
+                )
             return message
+        t_sleep = loop.time()
         await asyncio.sleep(0.01)
-        now = asyncio.get_running_loop().time()
+        now = loop.time()
+        polls.append(round(-(now - t_sleep), 4))  # negative = sleep gap
+    print(
+        f"STALLPROBE TIMEOUT {loop.time() - t_start:.3f}s polls={polls} gc_during={STALL_GC[n_gc0:]} "
+        f"gc_stats_delta={[(b['collections'] - a['collections']) for a, b in zip(stats0, _gc.get_stats())]} "
+        f"test={STALL_CUR['test']}"
+    )
     return None
 
 
