@@ -966,3 +966,40 @@ def assert_resp_response_in(
 ):
     expected = _select_expected(r, resp2_expected, resp3_expected, unified_expected)
     assert response in expected
+
+
+# ---- STALLPROBE (fork-only instrumentation, not part of any fix) ----
+import gc as _gc
+import time as _time
+
+STALL_CUR = {"test": None}
+STALL_GC = []  # (test nodeid, generation, duration_s, wallclock, collected)
+_STALL_T0 = [None]
+
+
+def _stall_gc_cb(phase, info):
+    if phase == "start":
+        _STALL_T0[0] = _time.perf_counter()
+    elif phase == "stop" and _STALL_T0[0] is not None:
+        d = _time.perf_counter() - _STALL_T0[0]
+        if d >= 0.005:
+            STALL_GC.append(
+                (STALL_CUR["test"], info.get("generation"), d, _time.time(), info.get("collected"))
+            )
+
+
+_gc.callbacks.append(_stall_gc_cb)
+
+
+def pytest_runtest_setup(item):
+    STALL_CUR["test"] = item.nodeid
+
+
+def pytest_sessionfinish(session, exitstatus):
+    big = [p for p in STALL_GC if p[2] >= 0.05]
+    print(
+        f"\nSTALLPROBE gc pauses >=5ms: {len(STALL_GC)}; >=50ms: {len(big)}; "
+        f"threshold={_gc.get_threshold()} stats={_gc.get_stats()}"
+    )
+    for t, g, d, ts, c in big:
+        print(f"STALLPROBE GC gen={g} {d * 1000:.0f}ms collected={c} during {t}")
