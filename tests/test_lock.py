@@ -1,4 +1,5 @@
 import time
+import uuid
 
 import pytest
 from redis import lock as lock_module
@@ -52,6 +53,16 @@ class TestLock:
     def test_lock_token_thread_local_false(self, r):
         lock = self.get_lock(r, "foo", thread_local=False)
         self._test_lock_token(r, lock)
+
+    def test_default_token_is_random_uuid4(self, r):
+        # The default token should be random and should not embed host or
+        # time data: a v1 UUID writes the host MAC address and a clock
+        # reading into the key's value. A v4 UUID is random.
+        lock = self.get_lock(r, "foo")
+        assert lock.acquire(blocking=False)
+        token = lock.local.token
+        assert uuid.UUID(token.decode()).version == 4
+        lock.release()
 
     def _test_lock_token(self, r, lock):
         assert lock.acquire(blocking=False, token="test")
@@ -285,6 +296,53 @@ class TestLock:
         assert 8000 < r.pttl("foo") <= 10000
         lock.release()
 
+    def test_extend_lock_zero_additional_time_replace_ttl_raises_error(self, r):
+        lock = self.get_lock(r, "foo", timeout=0)
+        assert lock.acquire(blocking=False)
+        with pytest.raises(LockNotOwnedError):
+            lock.extend(0, replace_ttl=True)
+        assert r.get("foo") == lock.local.token
+        assert r.pttl("foo") == -1
+        lock.release()
+
+    def test_extend_lock_zero_timeout_replace_ttl_keeps_existing_ttl(self, r):
+        lock = self.get_lock(r, "foo", timeout=10)
+        assert lock.acquire(blocking=False)
+        old_ttl = r.pttl("foo")
+        assert lock.extend(0, replace_ttl=True)
+        assert r.get("foo") == lock.local.token
+        assert 0 < r.pttl("foo") <= old_ttl
+        lock.release()
+
+    def test_extend_lock_negative_timeout_replace_ttl_keeps_existing_ttl(self, r):
+        lock = self.get_lock(r, "foo", timeout=10)
+        assert lock.acquire(blocking=False)
+        old_ttl = r.pttl("foo")
+        assert lock.extend(-1, replace_ttl=True)
+        assert r.get("foo") == lock.local.token
+        assert 0 < r.pttl("foo") <= old_ttl
+        lock.release()
+
+    def test_extend_lock_negative_additional_time_without_replace_keeps_existing_ttl(
+        self, r
+    ):
+        lock = self.get_lock(r, "foo", timeout=10)
+        assert lock.acquire(blocking=False)
+        old_ttl = r.pttl("foo")
+        assert lock.extend(-20)
+        assert r.get("foo") == lock.local.token
+        assert 0 < r.pttl("foo") <= old_ttl
+        lock.release()
+
+    def test_extend_lock_zero_timeout_without_replace_raises_error(self, r):
+        lock = self.get_lock(r, "foo", timeout=0)
+        assert lock.acquire(blocking=False)
+        with pytest.raises(LockNotOwnedError):
+            lock.extend(0)
+        assert r.get("foo") == lock.local.token
+        assert r.pttl("foo") == -1
+        lock.release()
+
     def test_extend_lock_float(self, r):
         lock = self.get_lock(r, "foo", timeout=10.5)
         assert lock.acquire(blocking=False)
@@ -320,6 +378,14 @@ class TestLock:
         assert r.pttl("foo") <= 5000
         assert lock.reacquire()
         assert 8000 < r.pttl("foo") <= 10000
+        lock.release()
+
+    def test_reacquire_lock_zero_timeout_keeps_lock(self, r):
+        lock = self.get_lock(r, "foo", timeout=0)
+        assert lock.acquire(blocking=False)
+        assert lock.reacquire()
+        assert r.get("foo") == lock.local.token
+        assert r.pttl("foo") == -1
         lock.release()
 
     def test_reacquiring_unlocked_lock_raises_error(self, r):

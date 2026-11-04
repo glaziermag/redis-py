@@ -17,6 +17,7 @@ from redis.exceptions import (
     ResponseError,
     TimeoutError,
 )
+from redis.sentinel import DEMOTED_MASTER_UNBLOCKED_ERROR
 
 
 class MasterNotFoundError(ConnectionError):
@@ -90,6 +91,18 @@ class SentinelManagedConnection(Connection):
                 # to has been demoted to a slave and there's a new master.
                 # calling disconnect will force the connection to re-query
                 # sentinel during the next connect() attempt.
+                await self.disconnect()
+                raise ConnectionError("The previous master is now a slave")
+            raise
+        except ResponseError as e:
+            if self.connection_pool.is_master and str(e).startswith(
+                DEMOTED_MASTER_UNBLOCKED_ERROR
+            ):
+                # A master that turns into a replica unblocks every client
+                # waiting on a blocking command (BLPOP, BRPOP, XREAD...) with
+                # this error and closes the connection, as when Sentinel runs
+                # a coordinated failover. Same meaning as the ReadOnlyError
+                # above: re-query Sentinel on the next connect() attempt.
                 await self.disconnect()
                 raise ConnectionError("The previous master is now a slave")
             raise
@@ -320,8 +333,12 @@ class Sentinel(AsyncSentinelCommands):
         for sentinel_no, sentinel in enumerate(self.sentinels):
             try:
                 masters = await sentinel.sentinel_masters()
-            except (ConnectionError, TimeoutError) as e:
-                collected_errors.append(f"{sentinel} - {e!r}")
+            except (ConnectionError, ResponseError, TimeoutError) as e:
+                # repr() names only the class; str() keeps the reply text
+                error = f"{sentinel} - {e!r}"
+                if str(e):
+                    error += f": {e}"
+                collected_errors.append(error)
                 continue
             state = masters.get(service_name)
             if state and self.check_master_state(state, service_name):

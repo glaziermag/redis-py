@@ -435,6 +435,18 @@ class ACLCommands(CommandsProtocol):
                   access to all keys while ``'cache:*'`` grants access to all keys that
                   are prefixed with ``cache:``.
                   `keys` should not be prefixed with a ``'~'``.
+            selectors: A list of ``(command, key)`` tuples, each added as one
+                       selector. `command` must be prefixed with a '+' to add or
+                       a '-' to remove the command permission, on keys matching
+                       `key`. A ``'~'`` is prepended to `key` unless it
+                       already starts with ``'~'`` or ``'%'``.
+                       Both values are joined into a single selector string,
+                       ``(command key)``, which the server splits on whitespace
+                       and applies token by token. Several commands or key
+                       patterns can therefore be packed into one tuple, e.g.
+                       ``("+get +set", "~app:*")``, but any whitespace in either
+                       value starts a new rule. Do not build these fields from
+                       unvalidated input such as a tenant or user name.
             reset: Indicates whether the user should be fully reset prior to applying
                    the new ACL. Setting this to `True` will remove all existing
                    passwords, flags, and privileges from the user and then apply the
@@ -1033,6 +1045,9 @@ class ManagementCommands(CommandsProtocol):
         Turn on the tracking mode.
         For more information, about the options look at client_tracking func.
 
+        On a client with client-side caching enabled this raises ``RedisError``:
+        the cache enables tracking itself.
+
         See https://redis.io/commands/client-tracking
         """
         return self.client_tracking(
@@ -1073,6 +1088,9 @@ class ManagementCommands(CommandsProtocol):
         """
         Turn off the tracking mode.
         For more information, about the options look at client_tracking func.
+
+        On a client with client-side caching enabled this raises ``RedisError``:
+        turning tracking off would stop invalidations for cached replies.
 
         See https://redis.io/commands/client-tracking
         """
@@ -1143,6 +1161,10 @@ class ManagementCommands(CommandsProtocol):
 
         ``prefix``  for broadcasting, register a given key prefix, so that
         notifications will be provided only for keys starting with this string.
+
+        On a client with client-side caching enabled this raises ``RedisError``:
+        the cache enables tracking itself, and changing it would stop
+        invalidations for cached replies.
 
         See https://redis.io/commands/client-tracking
         """
@@ -1736,6 +1758,9 @@ class ManagementCommands(CommandsProtocol):
 
         For more information, see https://redis.io/commands/info
         """
+        from redis.client import NEVER_DECODE
+
+        kwargs[NEVER_DECODE] = []
         if section is None:
             return self.execute_command("INFO", **kwargs)
         else:
@@ -1817,6 +1842,9 @@ class ManagementCommands(CommandsProtocol):
 
     def reset(self) -> (bytes | str) | Awaitable[bytes | str]:
         """Perform a full reset on the connection's server-side context.
+
+        On a client with client-side caching enabled this raises ``RedisError``:
+        the reset turns off the tracking the cache relies on for invalidations.
 
         See: https://redis.io/commands/reset
         """
@@ -2392,7 +2420,8 @@ class ManagementCommands(CommandsProtocol):
             metrics: List of metrics to track. Supported values: [HotkeysMetricsTypes.CPU, HotkeysMetricsTypes.NET]
             duration: Automatically stop the collection after `duration` seconds
             sample_ratio: Commands are sampled with probability 1/ratio (1 means no sampling)
-            slots: Only track keys on the specified hash slots
+            slots: Only track keys on the specified hash slots; an empty list is
+                treated as not given
 
         For more information, see https://redis.io/commands/hotkeys-start
         """
@@ -2415,7 +2444,7 @@ class ManagementCommands(CommandsProtocol):
             args.extend(["SAMPLE", sample_ratio])
 
         # Add optional SLOTS
-        if slots is not None:
+        if slots:
             args.append("SLOTS")
             args.append(len(slots))
             args.extend(slots)
@@ -2457,22 +2486,23 @@ class ManagementCommands(CommandsProtocol):
     @overload
     def hotkeys_get(
         self: SyncClientProtocol, **kwargs
-    ) -> list[dict[str | bytes, Any]]: ...
+    ) -> list[dict[str | bytes, Any]] | None: ...
 
     @overload
     def hotkeys_get(
         self: AsyncClientProtocol, **kwargs
-    ) -> Awaitable[list[dict[str | bytes, Any]]]: ...
+    ) -> Awaitable[list[dict[str | bytes, Any]] | None]: ...
 
     def hotkeys_get(
         self, **kwargs
     ) -> Union[
-        Awaitable[list[dict[str | bytes, Any]]],
-        list[dict[str | bytes, Any]],
+        Awaitable[list[dict[str | bytes, Any]] | None],
+        list[dict[str | bytes, Any]] | None,
     ]:
         """
         Retrieve the result of the ongoing collection session (if any),
         or the last collection session (if any).
+        Returns None if there is no collection session.
 
         HOTKEYS GET response is wrapped in an array for aggregation support.
         Each node returns a single-element array, allowing multiple node
@@ -3278,8 +3308,8 @@ class BasicKeyCommands(CommandsProtocol):
     def getex(
         self: SyncClientProtocol,
         name: KeyT,
-        ex: ExpiryT | None = None,
-        px: ExpiryT | None = None,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
         persist: bool = False,
@@ -3289,8 +3319,8 @@ class BasicKeyCommands(CommandsProtocol):
     def getex(
         self: AsyncClientProtocol,
         name: KeyT,
-        ex: ExpiryT | None = None,
-        px: ExpiryT | None = None,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
         persist: bool = False,
@@ -3299,8 +3329,8 @@ class BasicKeyCommands(CommandsProtocol):
     def getex(
         self,
         name: KeyT,
-        ex: ExpiryT | None = None,
-        px: ExpiryT | None = None,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
         persist: bool = False,
@@ -3314,6 +3344,9 @@ class BasicKeyCommands(CommandsProtocol):
         ``ex`` sets an expire flag on key ``name`` for ``ex`` seconds.
 
         ``px`` sets an expire flag on key ``name`` for ``px`` milliseconds.
+
+        ``ex`` and ``px`` also accept digit-only strings, such as ``"60"``
+        and ``"500"``, respectively.
 
         ``exat`` sets an expire flag on key ``name`` for ``ex`` seconds,
         specified in unix time.
@@ -3465,8 +3498,8 @@ class BasicKeyCommands(CommandsProtocol):
         lbound: EncodableT | None = None,
         ubound: EncodableT | None = None,
         saturate: bool = False,
-        ex: ExpiryT | None = None,
-        px: ExpiryT | None = None,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
         persist: bool = False,
@@ -3483,8 +3516,8 @@ class BasicKeyCommands(CommandsProtocol):
         lbound: EncodableT | None = None,
         ubound: EncodableT | None = None,
         saturate: bool = False,
-        ex: ExpiryT | None = None,
-        px: ExpiryT | None = None,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
         persist: bool = False,
@@ -3500,8 +3533,8 @@ class BasicKeyCommands(CommandsProtocol):
         lbound: EncodableT | None = None,
         ubound: EncodableT | None = None,
         saturate: bool = False,
-        ex: ExpiryT | None = None,
-        px: ExpiryT | None = None,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
         persist: bool = False,
@@ -3525,6 +3558,9 @@ class BasicKeyCommands(CommandsProtocol):
         Otherwise, out-of-bounds results are rejected, leaving the value and
         TTL unchanged and returning the current value and zero as the actual
         increment.
+
+        ``ex`` and ``px`` accept digit-only strings for seconds and milliseconds,
+        respectively, in addition to integers and timedeltas.
 
         ``enx`` applies the expiration only when the key does not already
         have an expiration, and requires ``ex``, ``px``, ``exat``, or ``pxat``.
@@ -3864,8 +3900,8 @@ class BasicKeyCommands(CommandsProtocol):
         self: SyncClientProtocol,
         mapping: Mapping[AnyKeyT, EncodableT],
         data_persist_option: DataPersistOptions | None = None,
-        ex: ExpiryT | None = None,
-        px: ExpiryT | None = None,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
         keepttl: bool = False,
@@ -3876,8 +3912,8 @@ class BasicKeyCommands(CommandsProtocol):
         self: AsyncClientProtocol,
         mapping: Mapping[AnyKeyT, EncodableT],
         data_persist_option: DataPersistOptions | None = None,
-        ex: ExpiryT | None = None,
-        px: ExpiryT | None = None,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
         keepttl: bool = False,
@@ -3887,8 +3923,8 @@ class BasicKeyCommands(CommandsProtocol):
         self,
         mapping: Mapping[AnyKeyT, EncodableT],
         data_persist_option: DataPersistOptions | None = None,
-        ex: ExpiryT | None = None,
-        px: ExpiryT | None = None,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
         keepttl: bool = False,
@@ -3912,6 +3948,9 @@ class BasicKeyCommands(CommandsProtocol):
         ``ex`` sets an expire flag on the keys in ``mapping`` for ``ex`` seconds.
 
         ``px`` sets an expire flag on the keys in ``mapping`` for ``px`` milliseconds.
+
+        ``ex`` and ``px`` also accept digit-only strings, such as ``"60"``
+        and ``"500"``, respectively.
 
         ``exat`` sets an expire flag on the keys in ``mapping`` for ``exat`` seconds,
             specified in unix time.
@@ -4347,8 +4386,8 @@ class BasicKeyCommands(CommandsProtocol):
         self: SyncClientProtocol,
         name: KeyT,
         value: EncodableT,
-        ex: ExpiryT | None = ...,
-        px: ExpiryT | None = ...,
+        ex: ExpiryT | str | None = ...,
+        px: ExpiryT | str | None = ...,
         nx: bool = ...,
         xx: bool = ...,
         keepttl: bool = ...,
@@ -4366,8 +4405,8 @@ class BasicKeyCommands(CommandsProtocol):
         self: AsyncClientProtocol,
         name: KeyT,
         value: EncodableT,
-        ex: ExpiryT | None = ...,
-        px: ExpiryT | None = ...,
+        ex: ExpiryT | str | None = ...,
+        px: ExpiryT | str | None = ...,
         nx: bool = ...,
         xx: bool = ...,
         keepttl: bool = ...,
@@ -4385,8 +4424,8 @@ class BasicKeyCommands(CommandsProtocol):
         self,
         name: KeyT,
         value: EncodableT,
-        ex: ExpiryT | None = None,
-        px: ExpiryT | None = None,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
         nx: bool = False,
         xx: bool = False,
         keepttl: bool = False,
@@ -4410,6 +4449,9 @@ class BasicKeyCommands(CommandsProtocol):
         ``ex`` sets an expire flag on key ``name`` for ``ex`` seconds.
 
         ``px`` sets an expire flag on key ``name`` for ``px`` milliseconds.
+
+        ``ex`` and ``px`` also accept digit-only strings, such as ``"60"``
+        and ``"500"``, respectively.
 
         ``nx`` if set to True, set the value at key ``name`` to ``value`` only
             if it does not exist.
@@ -5006,7 +5048,9 @@ class ListCommands(CommandsProtocol):
 
         For more information, see https://redis.io/commands/blmpop
         """
-        cmd_args = [timeout, numkeys, *args, direction, "COUNT", count]
+        cmd_args = [timeout, numkeys, *args, direction]
+        if count is not None:
+            cmd_args.extend(["COUNT", count])
 
         return self.execute_command("BLMPOP", *cmd_args)
 
@@ -5042,7 +5086,7 @@ class ListCommands(CommandsProtocol):
         For more information, see https://redis.io/commands/lmpop
         """
         cmd_args = [num_keys] + list(args) + [direction]
-        if count != 1:
+        if count is not None and count != 1:
             cmd_args.extend(["COUNT", count])
 
         return self.execute_command("LMPOP", *cmd_args)
@@ -6294,7 +6338,7 @@ class ScanCommands(CommandsProtocol):
             pieces.extend([b"MATCH", match])
         if count is not None:
             pieces.extend([b"COUNT", count])
-        if no_values is not None:
+        if no_values:
             pieces.extend([b"NOVALUES"])
         return self.execute_command("HSCAN", *pieces, no_values=no_values)
 
@@ -6511,6 +6555,16 @@ class AsyncScanCommands(ScanCommands):
             )
             for d in data:
                 yield d
+
+
+class SetDataPersistOptions(Enum):
+    # add each provided member only if none of them
+    # already exists.
+    MNX = "MNX"
+
+    # add each provided member only if all of them
+    # already exist.
+    MXX = "MXX"
 
 
 class SetCommands(CommandsProtocol):
@@ -6909,6 +6963,627 @@ class SetCommands(CommandsProtocol):
         """
         args = list_or_args(keys, args)
         return self.execute_command("SUNIONSTORE", dest, *args)
+
+    @overload
+    def saddex(
+        self: SyncClientProtocol,
+        name: KeyT,
+        *members: FieldT,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
+        exat: AbsExpiryT | None = None,
+        pxat: AbsExpiryT | None = None,
+        data_persist_option: SetDataPersistOptions | None = None,
+        keepttl: bool = False,
+    ) -> int: ...
+
+    @overload
+    def saddex(
+        self: AsyncClientProtocol,
+        name: KeyT,
+        *members: FieldT,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
+        exat: AbsExpiryT | None = None,
+        pxat: AbsExpiryT | None = None,
+        data_persist_option: SetDataPersistOptions | None = None,
+        keepttl: bool = False,
+    ) -> Awaitable[int]: ...
+
+    def saddex(
+        self,
+        name: KeyT,
+        *members: FieldT,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
+        exat: AbsExpiryT | None = None,
+        pxat: AbsExpiryT | None = None,
+        data_persist_option: SetDataPersistOptions | None = None,
+        keepttl: bool = False,
+    ) -> int | Awaitable[int]:
+        """
+        Add ``members`` to set ``name``, optionally setting an expiration time
+        on every member in the command.
+
+        ``ex`` sets an expire flag on ``members`` for ``ex`` seconds.
+
+        ``px`` sets an expire flag on ``members`` for ``px`` milliseconds.
+
+        ``ex`` and ``px`` also accept digit-only strings, such as ``"60"``
+        and ``"500"``, respectively.
+
+        ``exat`` sets an expire flag on ``members`` at ``exat`` seconds,
+            specified in unix time.
+
+        ``pxat`` sets an expire flag on ``members`` at ``pxat`` milliseconds,
+            specified in unix time.
+
+        ``data_persist_option`` can be set to ``MNX`` or ``MXX`` to control the
+            behavior of the command.
+            ``MNX`` will add the members only if none of them already exists.
+            ``MXX`` will add the members only if all of them already exist.
+            A logically expired member does not exist.
+
+        ``keepttl`` if True, retain the time to live associated with the
+            members that already exist. Without any expiration option, the
+            expiration of an existing member is discarded.
+
+        Returns ``1`` if at least one member was added, updated or deleted, and
+        ``0`` otherwise, for example when the ``MNX`` or ``MXX`` condition was
+        not met. ``1`` does not mean that the members exist: an expiration time
+        in the past removes the members that exist and adds none.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/saddex
+        """
+        if not at_most_one_value_set(
+            (
+                ex is not None,
+                px is not None,
+                exat is not None,
+                pxat is not None,
+                keepttl,
+            )
+        ):
+            raise DataError(
+                "``ex``, ``px``, ``exat``, ``pxat``, "
+                "and ``keepttl`` are mutually exclusive."
+            )
+
+        exp_options: list[EncodableT] = extract_expire_flags(ex, px, exat, pxat)
+        if data_persist_option:
+            exp_options.append(data_persist_option.value)
+
+        if keepttl:
+            exp_options.append("KEEPTTL")
+
+        return self.execute_command(
+            "SADDEX", name, *exp_options, "MEMBERS", len(members), *members
+        )
+
+    @overload
+    def sexpire(
+        self: SyncClientProtocol,
+        name: KeyT,
+        seconds: ExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> list[int]: ...
+
+    @overload
+    def sexpire(
+        self: AsyncClientProtocol,
+        name: KeyT,
+        seconds: ExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> Awaitable[list[int]]: ...
+
+    def sexpire(
+        self,
+        name: KeyT,
+        seconds: ExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> list[int] | Awaitable[list[int]]:
+        """
+        Sets or updates the expiration time for members within a set key, using
+        relative time in seconds.
+
+        If a member already has an expiration time, the behavior of the update can
+        be controlled using the `nx`, `xx`, `gt`, and `lt` parameters. A member
+        without an expiration time counts as one that never expires.
+
+        The return value provides detailed information about the outcome for each
+        member.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/sexpire
+
+        Args:
+            name: The name of the set key.
+            seconds: Expiration time in seconds, relative. Can be an integer, or a
+                     Python `timedelta` object.
+            members: List of members within the set to apply the expiration time to.
+            nx: Set expiry only when the member has no expiry.
+            xx: Set expiry only when the member has an existing expiry.
+            gt: Set expiry only when the new expiry is greater than the current one.
+            lt: Set expiry only when the new expiry is less than the current one.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `0` if the specified NX | XX | GT | LT condition was not met.
+                - `1` if the expiration time was set or updated.
+                - `2` if the member was deleted because the specified expiration
+                  time is in the past.
+        """
+        if nx + xx + gt + lt > 1:
+            raise ValueError("Only one of 'nx', 'xx', 'gt', 'lt' can be specified.")
+
+        if isinstance(seconds, datetime.timedelta):
+            seconds = int(seconds.total_seconds())
+
+        options = []
+        if nx:
+            options.append("NX")
+        if xx:
+            options.append("XX")
+        if gt:
+            options.append("GT")
+        if lt:
+            options.append("LT")
+
+        return self.execute_command(
+            "SEXPIRE", name, seconds, *options, "MEMBERS", len(members), *members
+        )
+
+    @overload
+    def spexpire(
+        self: SyncClientProtocol,
+        name: KeyT,
+        milliseconds: ExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> list[int]: ...
+
+    @overload
+    def spexpire(
+        self: AsyncClientProtocol,
+        name: KeyT,
+        milliseconds: ExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> Awaitable[list[int]]: ...
+
+    def spexpire(
+        self,
+        name: KeyT,
+        milliseconds: ExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> list[int] | Awaitable[list[int]]:
+        """
+        Sets or updates the expiration time for members within a set key, using
+        relative time in milliseconds.
+
+        If a member already has an expiration time, the behavior of the update can
+        be controlled using the `nx`, `xx`, `gt`, and `lt` parameters. A member
+        without an expiration time counts as one that never expires.
+
+        The return value provides detailed information about the outcome for each
+        member.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/spexpire
+
+        Args:
+            name: The name of the set key.
+            milliseconds: Expiration time in milliseconds, relative. Can be an
+                          integer, or a Python `timedelta` object.
+            members: List of members within the set to apply the expiration time to.
+            nx: Set expiry only when the member has no expiry.
+            xx: Set expiry only when the member has an existing expiry.
+            gt: Set expiry only when the new expiry is greater than the current one.
+            lt: Set expiry only when the new expiry is less than the current one.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `0` if the specified NX | XX | GT | LT condition was not met.
+                - `1` if the expiration time was set or updated.
+                - `2` if the member was deleted because the specified expiration
+                  time is in the past.
+        """
+        if nx + xx + gt + lt > 1:
+            raise ValueError("Only one of 'nx', 'xx', 'gt', 'lt' can be specified.")
+
+        if isinstance(milliseconds, datetime.timedelta):
+            milliseconds = int(milliseconds.total_seconds() * 1000)
+
+        options = []
+        if nx:
+            options.append("NX")
+        if xx:
+            options.append("XX")
+        if gt:
+            options.append("GT")
+        if lt:
+            options.append("LT")
+
+        return self.execute_command(
+            "SPEXPIRE", name, milliseconds, *options, "MEMBERS", len(members), *members
+        )
+
+    @overload
+    def sexpireat(
+        self: SyncClientProtocol,
+        name: KeyT,
+        unix_time_seconds: AbsExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> list[int]: ...
+
+    @overload
+    def sexpireat(
+        self: AsyncClientProtocol,
+        name: KeyT,
+        unix_time_seconds: AbsExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> Awaitable[list[int]]: ...
+
+    def sexpireat(
+        self,
+        name: KeyT,
+        unix_time_seconds: AbsExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> list[int] | Awaitable[list[int]]:
+        """
+        Sets or updates the expiration time for members within a set key, using an
+        absolute Unix timestamp in seconds.
+
+        If a member already has an expiration time, the behavior of the update can
+        be controlled using the `nx`, `xx`, `gt`, and `lt` parameters. A member
+        without an expiration time counts as one that never expires.
+
+        The return value provides detailed information about the outcome for each
+        member.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/sexpireat
+
+        Args:
+            name: The name of the set key.
+            unix_time_seconds: Expiration time as Unix timestamp in seconds. Can be
+                               an integer or a Python `datetime` object.
+            members: List of members within the set to apply the expiration time to.
+            nx: Set expiry only when the member has no expiry.
+            xx: Set expiry only when the member has an existing expiry.
+            gt: Set expiry only when the new expiry is greater than the current one.
+            lt: Set expiry only when the new expiry is less than the current one.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `0` if the specified NX | XX | GT | LT condition was not met.
+                - `1` if the expiration time was set or updated.
+                - `2` if the member was deleted because the specified expiration
+                  time is in the past.
+        """
+        if nx + xx + gt + lt > 1:
+            raise ValueError("Only one of 'nx', 'xx', 'gt', 'lt' can be specified.")
+
+        if isinstance(unix_time_seconds, datetime.datetime):
+            unix_time_seconds = int(unix_time_seconds.timestamp())
+
+        options = []
+        if nx:
+            options.append("NX")
+        if xx:
+            options.append("XX")
+        if gt:
+            options.append("GT")
+        if lt:
+            options.append("LT")
+
+        return self.execute_command(
+            "SEXPIREAT",
+            name,
+            unix_time_seconds,
+            *options,
+            "MEMBERS",
+            len(members),
+            *members,
+        )
+
+    @overload
+    def spexpireat(
+        self: SyncClientProtocol,
+        name: KeyT,
+        unix_time_milliseconds: AbsExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> list[int]: ...
+
+    @overload
+    def spexpireat(
+        self: AsyncClientProtocol,
+        name: KeyT,
+        unix_time_milliseconds: AbsExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> Awaitable[list[int]]: ...
+
+    def spexpireat(
+        self,
+        name: KeyT,
+        unix_time_milliseconds: AbsExpiryT,
+        *members: FieldT,
+        nx: bool = False,
+        xx: bool = False,
+        gt: bool = False,
+        lt: bool = False,
+    ) -> list[int] | Awaitable[list[int]]:
+        """
+        Sets or updates the expiration time for members within a set key, using an
+        absolute Unix timestamp in milliseconds.
+
+        If a member already has an expiration time, the behavior of the update can
+        be controlled using the `nx`, `xx`, `gt`, and `lt` parameters. A member
+        without an expiration time counts as one that never expires.
+
+        The return value provides detailed information about the outcome for each
+        member.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/spexpireat
+
+        Args:
+            name: The name of the set key.
+            unix_time_milliseconds: Expiration time as Unix timestamp in
+                                    milliseconds. Can be an integer or a Python
+                                    `datetime` object.
+            members: List of members within the set to apply the expiration time to.
+            nx: Set expiry only when the member has no expiry.
+            xx: Set expiry only when the member has an existing expiry.
+            gt: Set expiry only when the new expiry is greater than the current one.
+            lt: Set expiry only when the new expiry is less than the current one.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `0` if the specified NX | XX | GT | LT condition was not met.
+                - `1` if the expiration time was set or updated.
+                - `2` if the member was deleted because the specified expiration
+                  time is in the past.
+        """
+        if nx + xx + gt + lt > 1:
+            raise ValueError("Only one of 'nx', 'xx', 'gt', 'lt' can be specified.")
+
+        if isinstance(unix_time_milliseconds, datetime.datetime):
+            unix_time_milliseconds = int(unix_time_milliseconds.timestamp() * 1000)
+
+        options = []
+        if nx:
+            options.append("NX")
+        if xx:
+            options.append("XX")
+        if gt:
+            options.append("GT")
+        if lt:
+            options.append("LT")
+
+        return self.execute_command(
+            "SPEXPIREAT",
+            name,
+            unix_time_milliseconds,
+            *options,
+            "MEMBERS",
+            len(members),
+            *members,
+        )
+
+    @overload
+    def spersist(
+        self: SyncClientProtocol, name: KeyT, *members: FieldT
+    ) -> list[int]: ...
+
+    @overload
+    def spersist(
+        self: AsyncClientProtocol, name: KeyT, *members: FieldT
+    ) -> Awaitable[list[int]]: ...
+
+    def spersist(
+        self, name: KeyT, *members: FieldT
+    ) -> list[int] | Awaitable[list[int]]:
+        """
+        Removes the expiration time for each specified member in a set.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/spersist
+
+        Args:
+            name: The name of the set key.
+            members: A list of members within the set from which to remove the
+                     expiration time.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `-1` if the member exists but has no associated expiration time.
+                - `1` if the expiration time was successfully removed from the
+                  member.
+        """
+        return self.execute_command("SPERSIST", name, "MEMBERS", len(members), *members)
+
+    @overload
+    def sexpiretime(
+        self: SyncClientProtocol, name: KeyT, *members: FieldT
+    ) -> list[int]: ...
+
+    @overload
+    def sexpiretime(
+        self: AsyncClientProtocol, name: KeyT, *members: FieldT
+    ) -> Awaitable[list[int]]: ...
+
+    def sexpiretime(
+        self, name: KeyT, *members: FieldT
+    ) -> list[int] | Awaitable[list[int]]:
+        """
+        Returns the expiration times of set members as Unix timestamps in seconds,
+        rounded up to the next second.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/sexpiretime
+
+        Args:
+            name: The set key.
+            members: A list of members within the set for which to get the
+                     expiration time.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `-1` if the member exists but has no associated expire time.
+                - A positive integer representing the expiration Unix timestamp in
+                  seconds, if the member has an associated expiration time.
+        """
+        return self.execute_command(
+            "SEXPIRETIME", name, "MEMBERS", len(members), *members, keys=[name]
+        )
+
+    @overload
+    def spexpiretime(
+        self: SyncClientProtocol, name: KeyT, *members: FieldT
+    ) -> list[int]: ...
+
+    @overload
+    def spexpiretime(
+        self: AsyncClientProtocol, name: KeyT, *members: FieldT
+    ) -> Awaitable[list[int]]: ...
+
+    def spexpiretime(
+        self, name: KeyT, *members: FieldT
+    ) -> list[int] | Awaitable[list[int]]:
+        """
+        Returns the expiration times of set members as Unix timestamps in
+        milliseconds.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/spexpiretime
+
+        Args:
+            name: The set key.
+            members: A list of members within the set for which to get the
+                     expiration time.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `-1` if the member exists but has no associated expire time.
+                - A positive integer representing the expiration Unix timestamp in
+                  milliseconds, if the member has an associated expiration time.
+        """
+        return self.execute_command(
+            "SPEXPIRETIME", name, "MEMBERS", len(members), *members, keys=[name]
+        )
+
+    @overload
+    def sttl(self: SyncClientProtocol, name: KeyT, *members: FieldT) -> list[int]: ...
+
+    @overload
+    def sttl(
+        self: AsyncClientProtocol, name: KeyT, *members: FieldT
+    ) -> Awaitable[list[int]]: ...
+
+    def sttl(self, name: KeyT, *members: FieldT) -> list[int] | Awaitable[list[int]]:
+        """
+        Returns the TTL (Time To Live) in seconds for each specified member within a
+        set key, rounded up to the next second.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/sttl
+
+        Args:
+            name: The set key.
+            members: A list of members within the set for which to get the TTL.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `-1` if the member exists but has no associated expire time.
+                - A non-negative integer representing the TTL in seconds if the
+                  member has an associated expiration time.
+        """
+        return self.execute_command(
+            "STTL", name, "MEMBERS", len(members), *members, keys=[name]
+        )
+
+    @overload
+    def spttl(self: SyncClientProtocol, name: KeyT, *members: FieldT) -> list[int]: ...
+
+    @overload
+    def spttl(
+        self: AsyncClientProtocol, name: KeyT, *members: FieldT
+    ) -> Awaitable[list[int]]: ...
+
+    def spttl(self, name: KeyT, *members: FieldT) -> list[int] | Awaitable[list[int]]:
+        """
+        Returns the TTL (Time To Live) in milliseconds for each specified member
+        within a set key.
+
+        Available since Redis 8.12
+        For more information, see https://redis.io/commands/spttl
+
+        Args:
+            name: The set key.
+            members: A list of members within the set for which to get the TTL.
+
+        Returns:
+            Returns a list which contains for each member in the request:
+                - `-2` if the member does not exist, or if the key does not exist.
+                - `-1` if the member exists but has no associated expire time.
+                - A non-negative integer representing the TTL in milliseconds if
+                  the member has an associated expiration time.
+        """
+        return self.execute_command(
+            "SPTTL", name, "MEMBERS", len(members), *members, keys=[name]
+        )
 
 
 AsyncSetCommands = SetCommands
@@ -7811,7 +8486,8 @@ class StreamCommands(CommandsProtocol):
         min: minimum stream ID.
         max: maximum stream ID.
         count: number of messages to return
-        consumername: name of a consumer to filter by (optional).
+        consumername: name of a consumer to filter by (optional). Empty names
+        are supported; only None omits the consumer filter.
         """
         if {min, max, count} == {None}:
             if idle is not None or consumername is not None:
@@ -7843,7 +8519,7 @@ class StreamCommands(CommandsProtocol):
         except TypeError:
             pass
         # consumername
-        if consumername:
+        if consumername is not None:
             pieces.append(consumername)
 
         return self.execute_command("XPENDING", *pieces, parse_detail=True)
@@ -8270,6 +8946,14 @@ class SortedSetCommands(CommandsProtocol):
     Redis commands for Sorted Sets data type.
     see: https://redis.io/topics/data-types-intro#redis-sorted-sets
     """
+
+    def _zset_decode_responses(self) -> bool:
+        # Hosts that don't define get_connection_kwargs() keep the undecoded
+        # (bytes) legacy score text.
+        get_connection_kwargs = getattr(self, "get_connection_kwargs", None)
+        if get_connection_kwargs is None:
+            return False
+        return bool(get_connection_kwargs().get("decode_responses", False))
 
     @overload
     def zadd(
@@ -8802,7 +9486,7 @@ class SortedSetCommands(CommandsProtocol):
             args.append("MIN")
         else:
             args.append("MAX")
-        if count != 1:
+        if count is not None and count != 1:
             args.extend(["COUNT", count])
 
         return self.execute_command("ZMPOP", *args)
@@ -8857,7 +9541,8 @@ class SortedSetCommands(CommandsProtocol):
             args.append("MIN")
         else:
             args.append("MAX")
-        args.extend(["COUNT", count])
+        if count is not None:
+            args.extend(["COUNT", count])
 
         return self.execute_command("BZMPOP", *args)
 
@@ -8885,7 +9570,7 @@ class SortedSetCommands(CommandsProtocol):
                 "``withscores`` not supported in combination with ``bylex``."
             )
         pieces = [command]
-        if dest:
+        if dest is not None:
             pieces.append(dest)
         pieces.extend([name, start, end])
         if byscore:
@@ -8915,6 +9600,7 @@ class SortedSetCommands(CommandsProtocol):
         bylex: bool = False,
         offset: int | None = None,
         num: int | None = None,
+        use_rev: bool = False,
     ) -> ZSetRangeResponse: ...
 
     @overload
@@ -8930,6 +9616,7 @@ class SortedSetCommands(CommandsProtocol):
         bylex: bool = False,
         offset: int | None = None,
         num: int | None = None,
+        use_rev: bool = False,
     ) -> Awaitable[ZSetRangeResponse]: ...
 
     def zrange(
@@ -8944,6 +9631,7 @@ class SortedSetCommands(CommandsProtocol):
         bylex: bool = False,
         offset: int | None = None,
         num: int | None = None,
+        use_rev: bool = False,
     ) -> ZSetRangeResponse | Awaitable[ZSetRangeResponse]:
         """
         Return a range of values from sorted set ``name`` between
@@ -8953,6 +9641,13 @@ class SortedSetCommands(CommandsProtocol):
 
         ``desc`` a boolean indicating whether to sort the results in reversed
         order.
+
+        ``use_rev`` only affects the rank-based reverse path: when True
+        together with ``desc``, it sends ``ZRANGE ... REV`` instead of the
+        deprecated ``ZREVRANGE``. It is ignored for the byscore, bylex,
+        and offset/num paths, which already send ``ZRANGE ... REV``.
+        It defaults to False so callers on servers older than Redis 6.2
+        keep the ``ZREVRANGE`` fallback.
 
         ``withscores`` indicates to return the scores along with the values.
         The return type is a list of (value, score) pairs.
@@ -8975,7 +9670,13 @@ class SortedSetCommands(CommandsProtocol):
         """
         # Need to support ``desc`` also when using old redis version
         # because it was supported in 3.5.3 (of redis-py)
-        if not byscore and not bylex and (offset is None and num is None) and desc:
+        if (
+            not byscore
+            and not bylex
+            and (offset is None and num is None)
+            and desc
+            and not use_rev
+        ):
             return self.zrevrange(name, start, end, withscores, score_cast_func)
 
         return self._zrange(
@@ -9365,6 +10066,9 @@ class SortedSetCommands(CommandsProtocol):
             pieces.append("WITHSCORE")
 
         options = {"withscore": withscore, "score_cast_func": score_cast_func}
+        if withscore and score_cast_func is not float:
+            # Lets the RESP3 -> legacy callback match RESP2's str scores.
+            options["decode_responses"] = self._zset_decode_responses()
 
         return self.execute_command(*pieces, **options)
 
@@ -9489,6 +10193,9 @@ class SortedSetCommands(CommandsProtocol):
             pieces.append("WITHSCORE")
 
         options = {"withscore": withscore, "score_cast_func": score_cast_func}
+        if withscore and score_cast_func is not float:
+            # Lets the RESP3 -> legacy callback match RESP2's str scores.
+            options["decode_responses"] = self._zset_decode_responses()
 
         return self.execute_command(*pieces, **options)
 
@@ -9663,7 +10370,7 @@ class SortedSetCommands(CommandsProtocol):
         if dest is not None:
             pieces.append(dest)
         pieces.append(len(keys))
-        if isinstance(keys, dict):
+        if isinstance(keys, Mapping):
             keys, weights = keys.keys(), keys.values()
         else:
             weights = None
@@ -9863,8 +10570,8 @@ class HashCommands(CommandsProtocol):
         self: SyncClientProtocol,
         name: KeyT,
         *keys: FieldT,
-        ex: ExpiryT | None = None,
-        px: ExpiryT | None = None,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
         persist: bool = False,
@@ -9875,8 +10582,8 @@ class HashCommands(CommandsProtocol):
         self: AsyncClientProtocol,
         name: KeyT,
         *keys: FieldT,
-        ex: ExpiryT | None = None,
-        px: ExpiryT | None = None,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
         persist: bool = False,
@@ -9886,8 +10593,8 @@ class HashCommands(CommandsProtocol):
         self,
         name: KeyT,
         *keys: FieldT,
-        ex: ExpiryT | None = None,
-        px: ExpiryT | None = None,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
         persist: bool = False,
@@ -9899,6 +10606,9 @@ class HashCommands(CommandsProtocol):
         ``ex`` sets an expire flag on ``kyes`` for ``ex`` seconds.
 
         ``px`` sets an expire flag on ``keys`` for ``px`` milliseconds.
+
+        ``ex`` and ``px`` also accept digit-only strings, such as ``"60"``
+        and ``"500"``, respectively.
 
         ``exat`` sets an expire flag on ``keys`` for ``ex`` seconds,
         specified in unix time.
@@ -10071,8 +10781,8 @@ class HashCommands(CommandsProtocol):
         value: EncodableT | None = None,
         mapping: Mapping[FieldT, EncodableT] | None = None,
         items: Sequence[EncodableT] | None = None,
-        ex: ExpiryT | None = None,
-        px: ExpiryT | None = None,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
         data_persist_option: HashDataPersistOptions | None = None,
@@ -10087,8 +10797,8 @@ class HashCommands(CommandsProtocol):
         value: EncodableT | None = None,
         mapping: Mapping[FieldT, EncodableT] | None = None,
         items: Sequence[EncodableT] | None = None,
-        ex: ExpiryT | None = None,
-        px: ExpiryT | None = None,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
         data_persist_option: HashDataPersistOptions | None = None,
@@ -10102,8 +10812,8 @@ class HashCommands(CommandsProtocol):
         value: EncodableT | None = None,
         mapping: Mapping[FieldT, EncodableT] | None = None,
         items: Sequence[EncodableT] | None = None,
-        ex: ExpiryT | None = None,
-        px: ExpiryT | None = None,
+        ex: ExpiryT | str | None = None,
+        px: ExpiryT | str | None = None,
         exat: AbsExpiryT | None = None,
         pxat: AbsExpiryT | None = None,
         data_persist_option: HashDataPersistOptions | None = None,
@@ -10121,6 +10831,9 @@ class HashCommands(CommandsProtocol):
         ``ex`` sets an expire flag on ``keys`` for ``ex`` seconds.
 
         ``px`` sets an expire flag on ``keys`` for ``px`` milliseconds.
+
+        ``ex`` and ``px`` also accept digit-only strings, such as ``"60"``
+        and ``"500"``, respectively.
 
         ``exat`` sets an expire flag on ``keys`` for ``ex`` seconds,
             specified in unix time.
@@ -12077,8 +12790,8 @@ class GeoCommands(CommandsProtocol):
         if kwargs["member"] is None:
             if kwargs["longitude"] is None or kwargs["latitude"] is None:
                 raise DataError("GEOSEARCH must have member or longitude and latitude")
-        if kwargs["member"]:
-            if kwargs["longitude"] or kwargs["latitude"]:
+        if kwargs["member"] is not None:
+            if kwargs["longitude"] is not None or kwargs["latitude"] is not None:
                 raise DataError(
                     "GEOSEARCH member and longitude or latitude can't be set together"
                 )
@@ -12094,13 +12807,13 @@ class GeoCommands(CommandsProtocol):
             raise DataError("GEOSEARCH must have unit")
         if kwargs["unit"].lower() not in ("m", "km", "mi", "ft"):
             raise DataError("GEOSEARCH invalid unit")
-        if kwargs["radius"]:
-            if kwargs["width"] or kwargs["height"]:
+        if kwargs["radius"] is not None:
+            if kwargs["width"] is not None or kwargs["height"] is not None:
                 raise DataError(
                     "GEOSEARCH radius and width or height can't be set together"
                 )
             pieces.extend([b"BYRADIUS", kwargs["radius"], kwargs["unit"]])
-        if kwargs["width"] and kwargs["height"]:
+        if kwargs["width"] is not None and kwargs["height"] is not None:
             pieces.extend([b"BYBOX", kwargs["width"], kwargs["height"], kwargs["unit"]])
 
         # sort
@@ -12113,7 +12826,7 @@ class GeoCommands(CommandsProtocol):
                 raise DataError("GEOSEARCH invalid sort")
 
         # count any
-        if kwargs["count"]:
+        if kwargs["count"] is not None:
             pieces.extend([b"COUNT", kwargs["count"]])
             if kwargs["any"]:
                 pieces.append(b"ANY")
@@ -12532,6 +13245,158 @@ class FunctionCommands:
 AsyncFunctionCommands = FunctionCommands
 
 
+BlessFlag = Literal["NO-EVICT"]
+
+
+class BlessCommands(CommandsProtocol):
+    """
+    Redis BLESS commands: per-key flags that alter how the server treats a key.
+    """
+
+    @overload
+    def bless_get(self: SyncClientProtocol, name: KeyT) -> list[bytes | str]: ...
+
+    @overload
+    def bless_get(
+        self: AsyncClientProtocol, name: KeyT
+    ) -> Awaitable[list[bytes | str]]: ...
+
+    def bless_get(self, name: KeyT) -> list[bytes | str] | Awaitable[list[bytes | str]]:
+        """
+        Return the list of bless flags currently set on the key ``name``.
+
+        Raises a ``ResponseError`` if the key does not exist.
+
+        For more information, see https://redis.io/commands/bless-get
+        """
+        return self.execute_command("BLESS GET", name)
+
+    @overload
+    def bless_set(self: SyncClientProtocol, name: KeyT, flag: BlessFlag) -> int: ...
+
+    @overload
+    def bless_set(
+        self: AsyncClientProtocol, name: KeyT, flag: BlessFlag
+    ) -> Awaitable[int]: ...
+
+    def bless_set(self, name: KeyT, flag: BlessFlag) -> int | Awaitable[int]:
+        """
+        Set the bless ``flag`` on the key ``name``.
+
+        Returns 1 if the flag was set, 0 if it was already set.
+        Raises a ``ResponseError`` if the key does not exist.
+
+        For more information, see https://redis.io/commands/bless-set
+        """
+        return self.execute_command("BLESS SET", name, flag)
+
+    @overload
+    def bless_clear(self: SyncClientProtocol, name: KeyT, flag: BlessFlag) -> int: ...
+
+    @overload
+    def bless_clear(
+        self: AsyncClientProtocol, name: KeyT, flag: BlessFlag
+    ) -> Awaitable[int]: ...
+
+    def bless_clear(self, name: KeyT, flag: BlessFlag) -> int | Awaitable[int]:
+        """
+        Clear the bless ``flag`` from the key ``name``.
+
+        Returns 1 if the flag was cleared, 0 if it was not set.
+        Raises a ``ResponseError`` if the key does not exist.
+
+        For more information, see https://redis.io/commands/bless-clear
+        """
+        return self.execute_command("BLESS CLEAR", name, flag)
+
+    @overload
+    def bless_scan(
+        self: SyncClientProtocol,
+        cursor: int,
+        flag: BlessFlag,
+        count: int | None = None,
+        **kwargs,
+    ) -> ScanResponse: ...
+
+    @overload
+    def bless_scan(
+        self: AsyncClientProtocol,
+        cursor: int,
+        flag: BlessFlag,
+        count: int | None = None,
+        **kwargs,
+    ) -> Awaitable[ScanResponse]: ...
+
+    def bless_scan(
+        self,
+        cursor: int,
+        flag: BlessFlag,
+        count: int | None = None,
+        **kwargs,
+    ) -> ScanResponse | Awaitable[ScanResponse]:
+        """
+        Incrementally return lists of key names that carry the bless ``flag``.
+        Also return a cursor indicating the scan position.
+
+        ``cursor`` is the scan position to continue from; pass 0 to start
+            a new scan.
+
+        ``flag`` is the bless flag the returned keys must carry.
+
+        ``count`` provides a hint to Redis about the number of keys to
+            return per batch.
+
+        For more information, see https://redis.io/commands/bless-scan
+        """
+        pieces: list[EncodableT] = [cursor, flag]
+        if count is not None:
+            pieces.extend([b"COUNT", count])
+        return self.execute_command("BLESS SCAN", *pieces, **kwargs)
+
+    def bless_scan_iter(
+        self,
+        flag: BlessFlag,
+        count: int | None = None,
+        **kwargs,
+    ) -> Iterator[bytes | str]:
+        """
+        Make an iterator using the BLESS SCAN command so that the client doesn't
+        need to remember the cursor position.
+
+        ``count`` provides a hint to Redis about the number of keys to
+            return per batch.
+        """
+        cursor = "0"
+        while cursor != 0:
+            cursor, data = self.bless_scan(
+                cursor=cursor, flag=flag, count=count, **kwargs
+            )
+            yield from data
+
+
+class AsyncBlessCommands(BlessCommands):
+    async def bless_scan_iter(
+        self,
+        flag: BlessFlag,
+        count: int | None = None,
+        **kwargs,
+    ) -> AsyncIterator[bytes | str]:
+        """
+        Make an iterator using the BLESS SCAN command so that the client doesn't
+        need to remember the cursor position.
+
+        ``count`` provides a hint to Redis about the number of keys to
+            return per batch.
+        """
+        cursor = "0"
+        while cursor != 0:
+            cursor, data = await self.bless_scan(
+                cursor=cursor, flag=flag, count=count, **kwargs
+            )
+            for d in data:
+                yield d
+
+
 class DataAccessCommands(
     BasicKeyCommands,
     HyperlogCommands,
@@ -12577,6 +13442,7 @@ class CoreCommands(
     PubSubCommands,
     ScriptCommands,
     FunctionCommands,
+    BlessCommands,
 ):
     """
     A class containing all of the implemented redis commands. This class is
@@ -12593,6 +13459,7 @@ class AsyncCoreCommands(
     AsyncPubSubCommands,
     AsyncScriptCommands,
     AsyncFunctionCommands,
+    AsyncBlessCommands,
 ):
     """
     A class containing all of the implemented redis commands. This class is

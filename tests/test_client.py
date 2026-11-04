@@ -11,6 +11,7 @@ from redis.observability.config import OTelConfig, MetricGroup
 from redis.observability.metrics import RedisMetricsCollector
 
 
+@pytest.mark.fixed_client
 class TestRedisClientMetricsRecording:
     """
     Unit tests that verify metrics are properly recorded from Redis client
@@ -91,9 +92,7 @@ class TestRedisClientMetricsRecording:
             collector = RedisMetricsCollector(mock_meter, config)
 
         # Patch the recorder to use our collector
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             # Create Redis client with mocked connection pool
             client = redis.Redis(
                 connection_pool=mock_connection_pool,
@@ -148,9 +147,7 @@ class TestRedisClientMetricsRecording:
         with mock.patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             client = redis.Redis(
                 connection_pool=mock_connection_pool,
             )
@@ -186,9 +183,7 @@ class TestRedisClientMetricsRecording:
         with mock.patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             client = redis.Redis(
                 connection_pool=mock_connection_pool,
             )
@@ -245,9 +240,7 @@ class TestRedisClientMetricsRecording:
         with mock.patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             client = redis.Redis(
                 connection_pool=mock_connection_pool,
             )
@@ -295,9 +288,7 @@ class TestRedisClientMetricsRecording:
         with mock.patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             client = redis.Redis(
                 connection_pool=mock_connection_pool,
             )
@@ -393,9 +384,7 @@ class TestRedisClientMetricsRecording:
         with mock.patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             event_dispatcher = EventDispatcher()
 
             client = redis.Redis(
@@ -476,9 +465,7 @@ class TestRedisClientMetricsRecording:
         with mock.patch("redis.observability.metrics.OTEL_AVAILABLE", True):
             collector = RedisMetricsCollector(mock_meter, config)
 
-        with mock.patch.object(
-            recorder, "_get_or_create_collector", return_value=collector
-        ):
+        with mock.patch.object(recorder, "_metrics_collector", collector):
             event_dispatcher = EventDispatcher()
 
             client = redis.Redis(

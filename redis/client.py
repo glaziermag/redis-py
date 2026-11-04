@@ -3,6 +3,7 @@ import logging
 import re
 import threading
 import time
+from functools import lru_cache
 from itertools import chain
 from typing import (
     TYPE_CHECKING,
@@ -30,7 +31,7 @@ from redis._defaults import (
     DEFAULT_SOCKET_TIMEOUT,
 )
 from redis._parsers.encoders import Encoder
-from redis._parsers.helpers import bool_ok, get_response_callbacks
+from redis._parsers.helpers import bool_ok, decode_info, get_response_callbacks
 from redis.backoff import ExponentialWithJitterBackoff
 from redis.cache import CacheConfig, CacheInterface
 from redis.commands import (
@@ -89,6 +90,7 @@ from redis.utils import (
     SENTINEL,
     _set_info_logger,
     check_protocol_version,
+    command_text,
     deprecated_args,
     experimental_method,
     safe_str,
@@ -160,6 +162,48 @@ class CaseInsensitiveDict(dict):
     def update(self, data):
         data = CaseInsensitiveDict(data)
         super().update(data)
+
+    def copy(self) -> "CaseInsensitiveDict":
+        # Keys are already upper-cased; bypass __init__/__setitem__ so the
+        # copy does not re-run ``str.upper`` on every entry.
+        new = type(self).__new__(type(self))
+        dict.update(new, self)
+        return new
+
+
+@lru_cache(maxsize=None)
+def _cached_default_response_callbacks(
+    user_protocol: int | str | None,
+    legacy_responses: bool,
+) -> CaseInsensitiveDict:
+    """Build the canonical response-callback table for a given
+    ``(protocol, legacy_responses)`` combination exactly once.
+
+    The returned mapping is shared by every caller and MUST NOT be mutated or
+    handed to a client directly. Clients must use
+    :func:`default_response_callbacks`, which returns a per-client copy.
+    """
+    return CaseInsensitiveDict(
+        get_response_callbacks(
+            user_protocol=user_protocol,
+            legacy_responses=legacy_responses,
+        )
+    )
+
+
+def default_response_callbacks(
+    user_protocol: int | str | None,
+    legacy_responses: bool,
+) -> CaseInsensitiveDict:
+    """Return the default response-callback table for a given
+    ``(protocol, legacy_responses)`` combination.
+
+    This is the helper clients should use. It returns an independent, mutable
+    per-client table copied from the cached canonical one, so the table is not
+    rebuilt and re-upper-cased on every client construction, and changes such
+    as :meth:`Redis.set_response_callback` stay local to the client.
+    """
+    return _cached_default_response_callbacks(user_protocol, legacy_responses).copy()
 
 
 class AbstractRedis:
@@ -503,21 +547,6 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
                             "ssl_ciphers": ssl_ciphers,
                         }
                     )
-                if (cache_config or cache) and check_protocol_version(protocol, 3):
-                    kwargs.update(
-                        {
-                            "cache": cache,
-                            "cache_config": cache_config,
-                        }
-                    )
-                if metadata_resolver is not None:
-                    # A named ``ConnectionPool`` parameter, not a connection kwarg, so it
-                    # reaches the pool without also being forwarded to every connection.
-                    kwargs.update(
-                        {
-                            "metadata_resolver": metadata_resolver,
-                        }
-                    )
                 maint_notifications_enabled = (
                     maint_notifications_config and maint_notifications_config.enabled
                 )
@@ -539,6 +568,21 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
                             "oss_cluster_maint_notifications_handler": oss_cluster_maint_notifications_handler,
                         }
                     )
+            if (cache_config or cache) and check_protocol_version(protocol, 3):
+                kwargs.update(
+                    {
+                        "cache": cache,
+                        "cache_config": cache_config,
+                    }
+                )
+            if metadata_resolver is not None:
+                # A named ``ConnectionPool`` parameter, not a connection kwarg, so it
+                # reaches the pool without also being forwarded to every connection.
+                kwargs.update(
+                    {
+                        "metadata_resolver": metadata_resolver,
+                    }
+                )
             connection_pool = ConnectionPool(**kwargs)
             self._event_dispatcher.dispatch(
                 AfterPooledConnectionsInstantiationEvent(
@@ -573,11 +617,9 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             )
 
         connection_kwargs = self.connection_pool.connection_kwargs
-        self.response_callbacks = CaseInsensitiveDict(
-            get_response_callbacks(
-                user_protocol=connection_kwargs.get("protocol"),
-                legacy_responses=connection_kwargs.get("legacy_responses", True),
-            )
+        self.response_callbacks = default_response_callbacks(
+            connection_kwargs.get("protocol"),
+            connection_kwargs.get("legacy_responses", True),
         )
 
     def __repr__(self) -> str:
@@ -967,6 +1009,8 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             if NEVER_DECODE in options:
                 response = connection.read_response(disable_decoding=True)
                 options.pop(NEVER_DECODE)
+                if command_name == "INFO":
+                    response = decode_info(response, self.get_encoder())
             else:
                 response = connection.read_response()
         except ResponseError:
@@ -1067,12 +1111,26 @@ class Monitor:
         self.connection = self.connection_pool.get_connection()
 
     def __enter__(self):
-        self._start_monitor()
+        if self.connection is None:
+            self.connection = self.connection_pool.get_connection()
+        try:
+            self._start_monitor()
+        except BaseException:
+            try:
+                self.__exit__()
+            except Exception:
+                pass
+            raise
         return self
 
     def __exit__(self, *args):
-        self.connection.disconnect()
-        self.connection_pool.release(self.connection)
+        connection, self.connection = self.connection, None
+        if connection is None:
+            return
+        try:
+            connection.disconnect()
+        finally:
+            self.connection_pool.release(connection)
 
     def next_command(self):
         """Parse the response from a monitor command"""
@@ -1681,6 +1739,8 @@ class PubSub:
             return None
         if isinstance(response, bytes):
             response = [b"pong", response] if response != b"PONG" else [b"pong", b""]
+        elif isinstance(response, str):
+            response = ["pong", response] if response != "PONG" else ["pong", ""]
 
         message_type = str_if_bytes(response[0])
         if message_type == "pmessage":
@@ -1738,8 +1798,8 @@ class PubSub:
             elif message_type == "sunsubscribe":
                 s_channel = response[1]
                 if s_channel in self.pending_unsubscribe_shard_channels:
-                    self.pending_unsubscribe_shard_channels.discard(s_channel)
                     self.shard_channels.pop(s_channel, None)
+                    self.pending_unsubscribe_shard_channels.discard(s_channel)
             else:
                 channel = response[1]
                 if channel in self.pending_unsubscribe_channels:
@@ -1819,11 +1879,10 @@ class PubSubWorkerThread(threading.Thread):
         self.exception_handler = exception_handler
         self.sharded_pubsub = sharded_pubsub
         self._running = threading.Event()
+        # Set before start() so run() cannot undo an early stop() request.
+        self._running.set()
 
     def run(self) -> None:
-        if self._running.is_set():
-            return
-        self._running.set()
         pubsub = self.pubsub
         sleep_time = self.sleep_time
         while self._running.is_set():
@@ -1842,11 +1901,22 @@ class PubSubWorkerThread(threading.Thread):
                 self.exception_handler(e, pubsub, self)
         pubsub.close()
 
-    def stop(self) -> None:
+    def stop(self, timeout: Optional[float] = None) -> None:
+        """Wait for the worker to finish after clearing the running flag.
+
+        timeout bounds that wait. None waits until the worker exits.
+        The wait is skipped when stop() runs on the worker thread.
+        """
         # trip the flag so the run loop exits. the run loop will
         # close the pubsub connection, which disconnects the socket
         # and returns the connection to the pool.
         self._running.clear()
+        # wait for that close before returning, so a caller that
+        # follows stop() with pubsub.close() does not disconnect the
+        # socket while get_message is still reading it. the exception
+        # handler calls stop() from this thread; joining there deadlocks.
+        if threading.current_thread() is not self and self.is_alive():
+            self.join(timeout)
 
 
 class Pipeline(Redis):
@@ -2164,11 +2234,20 @@ class Pipeline(Redis):
         prep_error = _himport_exec.drain_pipeline_prepares(self, connection, fieldsets)
 
         responses = []
-        for args, options in commands:
-            try:
-                responses.append(self.parse_response(connection, args[0], **options))
-            except ResponseError as e:
-                responses.append(e)
+        try:
+            for args, options in commands:
+                try:
+                    responses.append(
+                        self.parse_response(connection, args[0], **options)
+                    )
+                except ResponseError as e:
+                    responses.append(e)
+        except BaseException:
+            # A response callback raised, so the replies of the rest of the batch
+            # are still on the socket. Drop the connection rather than hand them to
+            # the next caller that borrows it from the pool.
+            connection.disconnect()
+            raise
 
         # A PREPARE failure (rare: an invalid fieldset definition) is a hard error,
         # raised regardless of raise_on_error as it was before folding -- only now
@@ -2187,7 +2266,7 @@ class Pipeline(Redis):
                 raise r
 
     def annotate_exception(self, exception, number, command):
-        cmd = " ".join(map(safe_str, command))
+        cmd = command_text(command)
         msg = (
             f"Command # {number} ({truncate_text(cmd)}) of pipeline "
             f"caused error: {exception.args[0]}"

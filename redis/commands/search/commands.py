@@ -1,8 +1,9 @@
 import itertools
 import time
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Awaitable, Dict, List, Optional, Set, Union
 
 from redis._parsers.helpers import pairs_to_dict
+from redis.asyncio.client import Pipeline as AsyncioPipeline
 from redis.client import NEVER_DECODE, Pipeline
 from redis.commands.search.hybrid_query import (
     CombineResultsMethod,
@@ -79,6 +80,10 @@ SKIPINITIALSCAN = "SKIPINITIALSCAN"
 WITHSCORES = "WITHSCORES"
 FUZZY = "FUZZY"
 WITHPAYLOADS = "WITHPAYLOADS"
+
+
+# ``execute_command`` returns the pipeline itself when a command is queued.
+_PIPELINE_TYPES = (Pipeline, AsyncioPipeline)
 
 
 class SearchCommands:
@@ -331,6 +336,7 @@ class SearchCommands:
                 duration=kwargs["duration"],
                 has_payload=query._with_payloads,
                 with_scores=query._with_scores,
+                field_encodings=query._return_fields_decode_as,
             )
 
         return result, ProfileInformation(res[1])
@@ -380,11 +386,11 @@ class SearchCommands:
 
     # ---- RESP2 unified parsers (legacy_responses=False) ----
 
-    # Known FT.INFO attribute keys that are followed by a value
-    # (key-value pairs in the RESP2 flat list).
-    _INFO_ATTR_PAIR_KEYS = frozenset(
-        {"identifier", "attribute", "type", "WEIGHT", "SEPARATOR", "PHONETIC"}
-    )
+    # Uppercase FT.INFO attribute keys that are followed by a value
+    # (key-value pairs in the RESP2 flat list). Lowercase keys, such as
+    # ``identifier``, ``type`` or the vector keys ``algorithm`` and
+    # ``compression``, are always followed by a value; flags are uppercase.
+    _INFO_ATTR_PAIR_KEYS = frozenset({"WEIGHT", "SEPARATOR", "PHONETIC", "M"})
 
     @staticmethod
     def _normalize_info_attribute(attr_list):
@@ -394,6 +400,9 @@ class SearchCommands:
         WEIGHT, 1, SORTABLE, NOSTEM]``.
         RESP3 format: ``{"identifier": name, "attribute": alias, "type":
         "TEXT", "WEIGHT": "1", "flags": ["SORTABLE", "NOSTEM"]}``.
+
+        A key is followed by a value if it is lowercase or listed in
+        ``_INFO_ATTR_PAIR_KEYS``; any other key is a flag.
         """
         result = {}
         flags = []
@@ -401,7 +410,11 @@ class SearchCommands:
         i = 0
         while i < len(attr_list):
             key = str_if_bytes(attr_list[i])
-            if key in pair_keys and i + 1 < len(attr_list):
+            if (
+                isinstance(key, str)
+                and (key.islower() or key in pair_keys)
+                and i + 1 < len(attr_list)
+            ):
                 result[key] = str_if_bytes(attr_list[i + 1])
                 i += 2
             else:
@@ -464,6 +477,7 @@ class SearchCommands:
                 duration=kwargs["duration"],
                 has_payload=query._with_payloads,
                 with_scores=query._with_scores,
+                field_encodings=query._return_fields_decode_as,
             )
 
         profile_data = res[1]
@@ -788,6 +802,7 @@ class SearchCommands:
                 results_data,
                 duration=kwargs.get("duration", 0),
                 with_scores=getattr(query, "_with_scores", False),
+                field_encodings=getattr(query, "_return_fields_decode_as", None),
             )
         profile_data = self._to_string_recursive(profile_data)
         return result, profile_data
@@ -1281,6 +1296,8 @@ class SearchCommands:
         """
 
         res = self.execute_command(INFO_CMD, self.index_name)
+        if isinstance(res, _PIPELINE_TYPES):
+            return res
         return self._parse_results(INFO_CMD, res)
 
     def get_params_args(
@@ -1372,7 +1389,9 @@ class SearchCommands:
             - **params_substitution**: Dict[str, Union[str, int, float, bytes]]
                         Contains the parameters substitution
             - **timeout**: int - contains the timeout in milliseconds
-            - **cursor**: HybridCursorQuery object - contains the cursor configuration
+            - **cursor**: HybridCursorQuery object - contains the cursor configuration.
+                        ``WITHCURSOR`` for ``FT.HYBRID`` is exposed only by
+                        Redis versions 8.4 to 8.10.
 
 
         For more information see `FT.SEARCH <https://redis.io/commands/ft.hybrid>`.
@@ -1388,7 +1407,7 @@ class SearchCommands:
             options["post_processing"] = post_processing
         if params_substitution:
             pieces.extend(self.get_params_args(params_substitution))
-        if timeout:
+        if timeout is not None:
             pieces.extend(("TIMEOUT", timeout))
         if cursor:
             options["cursor"] = True
@@ -1449,7 +1468,13 @@ class SearchCommands:
             raise ValueError("Bad query", query)
         cmd += self.get_params_args(query_params)
 
-        raw = self.execute_command(*cmd)
+        options = {}
+        if isinstance(self, Pipeline):
+            options["query"] = query
+            options["has_cursor"] = has_cursor
+        raw = self.execute_command(*cmd, **options)
+        if isinstance(raw, _PIPELINE_TYPES):
+            return raw
         return self._parse_results(
             AGGREGATE_CMD, raw, query=query, has_cursor=has_cursor
         )
@@ -1476,28 +1501,13 @@ class SearchCommands:
 
         return AggregateResult(rows, cursor, schema)
 
-    def profile(
+    def _mk_profile_args(
         self,
         query: Union[Query, AggregateRequest],
         limited: bool = False,
         query_params: Optional[Dict[str, Union[str, int, float, bytes]]] = None,
-    ) -> Union[
-        tuple[Union[Result, AggregateResult], ProfileInformation],
-        ProfileInformation,
-    ]:
-        """
-        Performs a search or aggregate command and collects performance
-        information.
-
-        ### Parameters
-
-        **query**: This can be either an `AggregateRequest` or `Query`.
-        **limited**: If set to True, removes details of reader iterator.
-        **query_params**: Define one or more value parameters.
-        Each parameter has a name and a value.
-
-        """
-        st = time.monotonic()
+    ):
+        """Build the shared arguments for synchronous and asynchronous profiling."""
         cmd = [PROFILE_CMD, self.index_name, ""]
         if limited:
             cmd.append("LIMITED")
@@ -1513,7 +1523,41 @@ class SearchCommands:
         else:
             raise ValueError("Must provide AggregateRequest object or Query object.")
 
-        res = self.execute_command(*cmd)
+        return cmd
+
+    def profile(
+        self,
+        query: Union[Query, AggregateRequest],
+        limited: bool = False,
+        query_params: Optional[Dict[str, Union[str, int, float, bytes]]] = None,
+    ) -> Union[
+        tuple[Union[Result, AggregateResult], ProfileInformation],
+        ProfileInformation,
+    ]:
+        """
+        Performs a search or aggregate command and collects performance
+        information. Search results honor the query's field encodings. For binary
+        fields, use ``decode_responses=False`` and ``Query.return_field`` with
+        ``decode_field=False``.
+
+        ### Parameters
+
+        **query**: This can be either an `AggregateRequest` or `Query`.
+        **limited**: If set to True, removes details of reader iterator.
+        **query_params**: Define one or more value parameters.
+        Each parameter has a name and a value.
+
+        """
+        st = time.monotonic()
+        cmd = self._mk_profile_args(query, limited, query_params)
+
+        options = {}
+        if isinstance(self, Pipeline):
+            options["query"] = query
+            options["duration"] = 0
+        res = self.execute_command(*cmd, **options)
+        if isinstance(res, _PIPELINE_TYPES):
+            return res
 
         return self._parse_results(
             PROFILE_CMD, res, query=query, duration=(time.monotonic() - st) * 1000.0
@@ -1545,6 +1589,8 @@ class SearchCommands:
 
         res = self.execute_command(*cmd)
 
+        if isinstance(res, _PIPELINE_TYPES):
+            return res
         return self._parse_results(SPELLCHECK_CMD, res)
 
     def dict_add(self, name: str, *terms: List[str]):
@@ -1603,6 +1649,8 @@ class SearchCommands:
         """  # noqa
         cmd = [CONFIG_CMD, "SET", option, value]
         raw = self.execute_command(*cmd)
+        if isinstance(raw, _PIPELINE_TYPES):
+            return raw
         return raw == "OK"
 
     @deprecated_function(
@@ -1620,6 +1668,8 @@ class SearchCommands:
         """  # noqa
         cmd = [CONFIG_CMD, "GET", option]
         res = self.execute_command(*cmd)
+        if isinstance(res, _PIPELINE_TYPES):
+            return res
         return self._parse_results(CONFIG_CMD, res)
 
     def tagvals(self, tagfield: str):
@@ -1779,6 +1829,8 @@ class SearchCommands:
             args.append(WITHPAYLOADS)
 
         res = self.execute_command(*args)
+        if isinstance(res, _PIPELINE_TYPES):
+            return res
         results = []
         if not res:
             return results
@@ -1820,10 +1872,86 @@ class SearchCommands:
         For more information see `FT.SYNDUMP <https://redis.io/commands/ft.syndump>`_.
         """  # noqa
         res = self.execute_command(SYNDUMP_CMD, self.index_name)
+        if isinstance(res, _PIPELINE_TYPES):
+            return res
         return self._parse_results(SYNDUMP_CMD, res)
 
 
 class AsyncSearchCommands(SearchCommands):
+    def syndump(self):
+        """
+        Dumps the contents of a synonym group.
+
+        The command is used to dump the synonyms data structure.
+        Returns a list of synonym terms and their synonym group ids.
+
+        For more information see `FT.SYNDUMP <https://redis.io/commands/ft.syndump>`_.
+
+        Await direct calls; pipeline calls queue immediately.
+        """  # noqa
+        if isinstance(self.client, _PIPELINE_TYPES):
+            return super().syndump()
+        return self._syndump()
+
+    async def _syndump(self):
+        res = await self.execute_command(SYNDUMP_CMD, self.index_name)
+        return self._parse_results(SYNDUMP_CMD, res)
+
+    def profile(
+        self,
+        query: Union[Query, AggregateRequest],
+        limited: bool = False,
+        query_params: Optional[Dict[str, Union[str, int, float, bytes]]] = None,
+    ) -> Union[
+        Awaitable[
+            Union[
+                tuple[Union[Result, AggregateResult], ProfileInformation],
+                ProfileInformation,
+            ]
+        ],
+        AsyncioPipeline,
+    ]:
+        """
+        Performs a search or aggregate command and collects performance
+        information. Search results honor the query's field encodings. For binary
+        fields, use ``decode_responses=False`` and ``Query.return_field`` with
+        ``decode_field=False``.
+
+        Await direct calls; pipeline calls queue immediately.
+
+        ### Parameters
+
+        **query**: This can be either an `AggregateRequest` or `Query`.
+        **limited**: If set to True, removes details of reader iterator.
+        **query_params**: Define one or more value parameters.
+        Each parameter has a name and a value.
+
+        """
+        if isinstance(self.client, _PIPELINE_TYPES):
+            # Keep the existing synchronous pipeline enqueue API, including
+            # both ft().pipeline() and pipeline().ft().
+            return super().profile(query, limited=limited, query_params=query_params)
+        return self._profile(query, limited=limited, query_params=query_params)
+
+    async def _profile(
+        self,
+        query: Union[Query, AggregateRequest],
+        limited: bool = False,
+        query_params: Optional[Dict[str, Union[str, int, float, bytes]]] = None,
+    ) -> Union[
+        tuple[Union[Result, AggregateResult], ProfileInformation],
+        ProfileInformation,
+    ]:
+        """Execute and parse a direct asynchronous profile command."""
+        st = time.monotonic()
+        cmd = self._mk_profile_args(query, limited, query_params)
+
+        res = await self.execute_command(*cmd)
+
+        return self._parse_results(
+            PROFILE_CMD, res, query=query, duration=(time.monotonic() - st) * 1000.0
+        )
+
     async def info(self):
         """
         Get info and stats about the current index, including the number of
@@ -1833,6 +1961,8 @@ class AsyncSearchCommands(SearchCommands):
         """
 
         res = await self.execute_command(INFO_CMD, self.index_name)
+        if isinstance(res, _PIPELINE_TYPES):
+            return res
         return self._parse_results(INFO_CMD, res)
 
     async def aliaslist(self) -> Set[str | bytes]:
@@ -1848,7 +1978,7 @@ class AsyncSearchCommands(SearchCommands):
         For more information see `FT.ALIASLIST <https://redis.io/commands/ft.aliaslist>`_.
         """  # noqa
         res = await self.execute_command(ALIAS_LIST_CMD, self.index_name)
-        if isinstance(res, Pipeline):
+        if isinstance(res, _PIPELINE_TYPES):
             return res
         return self._parse_results(ALIAS_LIST_CMD, res)
 
@@ -1881,7 +2011,7 @@ class AsyncSearchCommands(SearchCommands):
 
         res = await self.execute_command(SEARCH_CMD, *args, **options)
 
-        if isinstance(res, Pipeline):
+        if isinstance(res, _PIPELINE_TYPES):
             return res
 
         return self._parse_results(
@@ -1911,7 +2041,9 @@ class AsyncSearchCommands(SearchCommands):
             - **params_substitution**: Dict[str, Union[str, int, float, bytes]]
                         Contains the parameters substitution
             - **timeout**: int - contains the timeout in milliseconds
-            - **cursor**: HybridCursorQuery object - contains the cursor configuration
+            - **cursor**: HybridCursorQuery object - contains the cursor configuration.
+                        ``WITHCURSOR`` for ``FT.HYBRID`` is exposed only by
+                        Redis versions 8.4 to 8.10.
 
 
         For more information see `FT.SEARCH <https://redis.io/commands/ft.hybrid>`.
@@ -1927,7 +2059,7 @@ class AsyncSearchCommands(SearchCommands):
             options["post_processing"] = post_processing
         if params_substitution:
             pieces.extend(self.get_params_args(params_substitution))
-        if timeout:
+        if timeout is not None:
             pieces.extend(("TIMEOUT", timeout))
         if cursor:
             options["cursor"] = True
@@ -1941,7 +2073,7 @@ class AsyncSearchCommands(SearchCommands):
 
         res = await self.execute_command(*pieces, **options)
 
-        if isinstance(res, Pipeline):
+        if isinstance(res, _PIPELINE_TYPES):
             return res
 
         return self._parse_results(HYBRID_CMD, res, **options)
@@ -1973,7 +2105,13 @@ class AsyncSearchCommands(SearchCommands):
             raise ValueError("Bad query", query)
         cmd += self.get_params_args(query_params)
 
-        raw = await self.execute_command(*cmd)
+        options = {}
+        if isinstance(self, Pipeline):
+            options["query"] = query
+            options["has_cursor"] = has_cursor
+        raw = await self.execute_command(*cmd, **options)
+        if isinstance(raw, _PIPELINE_TYPES):
+            return raw
         return self._parse_results(
             AGGREGATE_CMD, raw, query=query, has_cursor=has_cursor
         )
@@ -2004,6 +2142,8 @@ class AsyncSearchCommands(SearchCommands):
 
         res = await self.execute_command(*cmd)
 
+        if isinstance(res, _PIPELINE_TYPES):
+            return res
         return self._parse_results(SPELLCHECK_CMD, res)
 
     @deprecated_function(
@@ -2022,6 +2162,8 @@ class AsyncSearchCommands(SearchCommands):
         """  # noqa
         cmd = [CONFIG_CMD, "SET", option, value]
         raw = await self.execute_command(*cmd)
+        if isinstance(raw, _PIPELINE_TYPES):
+            return raw
         return raw == "OK"
 
     @deprecated_function(
@@ -2040,6 +2182,8 @@ class AsyncSearchCommands(SearchCommands):
         cmd = [CONFIG_CMD, "GET", option]
         res = {}
         res = await self.execute_command(*cmd)
+        if isinstance(res, _PIPELINE_TYPES):
+            return res
         return self._parse_results(CONFIG_CMD, res)
 
     async def load_document(self, id, field_encodings: Optional[Dict[str, Any]] = None):
@@ -2135,6 +2279,8 @@ class AsyncSearchCommands(SearchCommands):
             args.append(WITHPAYLOADS)
 
         ret = await self.execute_command(*args)
+        if isinstance(ret, _PIPELINE_TYPES):
+            return ret
         results = []
         if not ret:
             return results

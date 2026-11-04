@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 
 import pytest
 import pytest_asyncio
@@ -55,6 +56,16 @@ class TestLock:
     async def test_lock_token_thread_local_false(self, r):
         lock = self.get_lock(r, "foo", thread_local=False)
         await self._test_lock_token(r, lock)
+
+    async def test_default_token_is_random_uuid4(self, r):
+        # The default token should be random and should not embed host or
+        # time data: a v1 UUID writes the host MAC address and a clock
+        # reading into the key's value. A v4 UUID is random.
+        lock = self.get_lock(r, "foo")
+        assert await lock.acquire(blocking=False)
+        token = lock.local.token
+        assert uuid.UUID(token.decode()).version == 4
+        await lock.release()
 
     async def _test_lock_token(self, r, lock):
         assert await lock.acquire(blocking=False, token="test")
@@ -183,6 +194,45 @@ class TestLock:
             async with self.get_lock(r, "foo", raise_on_release_error=True) as lock:
                 await lock.release()
 
+    async def test_acquire_sleep_overrides_constructor_sleep(self, r, fake_lock_time):
+        lock1 = self.get_lock(r, "foo")
+        assert await lock1.acquire(blocking=False)
+        try:
+            bt = 0.2
+            sleep = 0.05
+            override = 0.025
+            lock2 = self.get_lock(r, "foo", sleep=sleep, blocking_timeout=bt)
+            assert not await lock2.acquire(sleep=override)
+            assert fake_lock_time.sleeps == [override] * 8
+        finally:
+            await lock1.release()
+
+    async def test_blocking_timeout_sleep_overrides_constructor_sleep(
+        self, r, fake_lock_time
+    ):
+        lock1 = self.get_lock(r, "foo")
+        assert await lock1.acquire(blocking=False)
+        try:
+            bt = 0.2
+            sleep = 0.1
+            override = 0.05
+            lock2 = self.get_lock(r, "foo", sleep=sleep, blocking_timeout=bt)
+            assert not await lock2.acquire(sleep=override)
+            assert fake_lock_time.now == pytest.approx(bt)
+            assert fake_lock_time.sleeps == [override] * 4
+        finally:
+            await lock1.release()
+
+    async def test_blocking_first_positional_still_binds(self, r, fake_lock_time):
+        lock1 = self.get_lock(r, "foo")
+        assert await lock1.acquire(blocking=False)
+        try:
+            lock2 = self.get_lock(r, "foo")
+            assert not await lock2.acquire(False)
+            assert fake_lock_time.sleeps == []
+        finally:
+            await lock1.release()
+
     async def test_high_sleep_small_blocking_timeout(self, r, fake_lock_time):
         lock1 = self.get_lock(r, "foo")
         assert await lock1.acquire(blocking=False)
@@ -259,6 +309,53 @@ class TestLock:
         assert 8000 < (await r.pttl("foo")) <= 10000
         await lock.release()
 
+    async def test_extend_lock_zero_additional_time_replace_ttl_raises_error(self, r):
+        lock = self.get_lock(r, "foo", timeout=0)
+        assert await lock.acquire(blocking=False)
+        with pytest.raises(LockNotOwnedError):
+            await lock.extend(0, replace_ttl=True)
+        assert await r.get("foo") == lock.local.token
+        assert await r.pttl("foo") == -1
+        await lock.release()
+
+    async def test_extend_lock_zero_timeout_replace_ttl_keeps_existing_ttl(self, r):
+        lock = self.get_lock(r, "foo", timeout=10)
+        assert await lock.acquire(blocking=False)
+        old_ttl = await r.pttl("foo")
+        assert await lock.extend(0, replace_ttl=True)
+        assert await r.get("foo") == lock.local.token
+        assert 0 < (await r.pttl("foo")) <= old_ttl
+        await lock.release()
+
+    async def test_extend_lock_negative_timeout_replace_ttl_keeps_existing_ttl(self, r):
+        lock = self.get_lock(r, "foo", timeout=10)
+        assert await lock.acquire(blocking=False)
+        old_ttl = await r.pttl("foo")
+        assert await lock.extend(-1, replace_ttl=True)
+        assert await r.get("foo") == lock.local.token
+        assert 0 < (await r.pttl("foo")) <= old_ttl
+        await lock.release()
+
+    async def test_extend_lock_negative_additional_time_without_replace_keeps_existing_ttl(
+        self, r
+    ):
+        lock = self.get_lock(r, "foo", timeout=10)
+        assert await lock.acquire(blocking=False)
+        old_ttl = await r.pttl("foo")
+        assert await lock.extend(-20)
+        assert await r.get("foo") == lock.local.token
+        assert 0 < (await r.pttl("foo")) <= old_ttl
+        await lock.release()
+
+    async def test_extend_lock_zero_timeout_without_replace_raises_error(self, r):
+        lock = self.get_lock(r, "foo", timeout=0)
+        assert await lock.acquire(blocking=False)
+        with pytest.raises(LockNotOwnedError):
+            await lock.extend(0)
+        assert await r.get("foo") == lock.local.token
+        assert await r.pttl("foo") == -1
+        await lock.release()
+
     async def test_extend_lock_float(self, r):
         lock = self.get_lock(r, "foo", timeout=10.5)
         assert await lock.acquire(blocking=False)
@@ -294,6 +391,14 @@ class TestLock:
         assert await r.pttl("foo") <= 5000
         assert await lock.reacquire()
         assert 8000 < (await r.pttl("foo")) <= 10000
+        await lock.release()
+
+    async def test_reacquire_lock_zero_timeout_keeps_lock(self, r):
+        lock = self.get_lock(r, "foo", timeout=0)
+        assert await lock.acquire(blocking=False)
+        assert await lock.reacquire()
+        assert await r.get("foo") == lock.local.token
+        assert await r.pttl("foo") == -1
         await lock.release()
 
     async def test_reacquiring_unlocked_lock_raises_error(self, r):

@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import copy
 import inspect
 import logging
@@ -14,7 +13,6 @@ from itertools import chain
 from types import MappingProxyType
 from typing import (
     Any,
-    AsyncIterator,
     Callable,
     Iterable,
     List,
@@ -52,7 +50,7 @@ else:
 from ..auth.token import TokenInterface
 from ..driver_info import DriverInfo, resolve_driver_info
 from ..event import AsyncAfterConnectionReleasedEvent, EventDispatcher
-from ..utils import deprecated_args, format_error_message
+from ..utils import deprecated_args, format_error_message, is_os_level_timeout
 
 # the functionality is available in 3.11.x but has a major issue before
 # 3.11.3. See https://github.com/redis/redis-py/issues/2633
@@ -71,12 +69,15 @@ from redis.asyncio.observability.recorder import (
     record_connection_closed,
     record_connection_count,
     record_connection_create_time,
+    record_connection_timeout,
     record_connection_wait_time,
     record_error_count,
 )
-from redis.asyncio.retry import Retry
+from redis.asyncio.retry import Retry, _to_async_retry
 from redis.backoff import NoBackoff
+from redis.connection import HiredisRespSerializer
 from redis.credentials import CredentialProvider, UsernamePasswordCredentialProvider
+from redis.event import MaintenanceCompletedEvent
 from redis.exceptions import (
     AuthenticationError,
     AuthenticationWrongNumberOfArgsError,
@@ -89,11 +90,13 @@ from redis.exceptions import (
 )
 from redis.himport import HImportRegistry
 from redis.maint_notifications import (
+    PENDING_PUSH_NOTIFICATIONS_READ_TIMEOUT,
     MaintenanceState,
     MaintNotificationsConfig,
     NodeMovingNotification,
     _build_moving_cleanup_connection_kwargs,
     _build_moving_connection_kwargs,
+    _dispatch_maintenance_event,
 )
 from redis.observability.metrics import CloseReason
 from redis.typing import EncodableT
@@ -112,6 +115,7 @@ from .._defaults import (
     get_default_socket_keepalive_options,
 )
 from .._parsers import (
+    UNRECOVERABLE_PARSE_ERRORS,
     AsyncPushNotificationsParser,
     BaseParser,
     Encoder,
@@ -223,6 +227,132 @@ class AsyncMaintNotificationsAbstractConnection:
                 "Maintenance notifications are only supported with hiredis and RESP3 parsers!"
             )
         return parser
+
+    def _complete_maintenance_on_disconnect(self) -> None:
+        """
+        Restore the settings a maintenance relaxed on this connection when it is
+        closed, and report the relaxation as completed - the same way the
+        completion notification would have been reported. The MOVING state is
+        left alone: it is owned by the pool-level TTL cleanup.
+        """
+        if self.maintenance_state != MaintenanceState.MAINTENANCE:
+            return
+        self.reset_tmp_settings(reset_relaxed_timeout=True)
+        self.maintenance_state = MaintenanceState.NONE
+        # reset the sets that keep track of received start maint
+        # notifications and skipped end maint notifications
+        self.reset_received_notifications()
+        if self.maint_notifications_config is not None:
+            pool_handler = self._maint_notifications_pool_handler
+            _dispatch_maintenance_event(
+                self.maint_notifications_config,
+                MaintenanceCompletedEvent(
+                    connection_pool=(
+                        pool_handler.pool if pool_handler is not None else None
+                    ),
+                    connection=self,
+                    state=MaintenanceState.MAINTENANCE,
+                    notification=None,
+                    config=self.maint_notifications_config,
+                ),
+            )
+
+    async def handle_pending_push_notifications(self) -> None:
+        """
+        Process the push notifications buffered on this idle connection if it
+        is still alive, and report a connection that has to be reconnected.
+
+        A pooled connection that has readable data while idle either has push
+        notifications waiting, or has been closed by the server - or both, when
+        the notifications announced the maintenance that closed it. The socket
+        state cannot be told apart from the pending data without reading it, so
+        the notifications are collected first and handed to their handlers only
+        once the drain has shown the socket to be alive: the server closes the
+        connections of a moved endpoint when the MOVING time-to-live expires,
+        so an alive socket means the maintenance is still in progress and the
+        announced address current. A notification buffered on a socket the
+        server has since closed describes a maintenance that is over, after
+        which the configured address is what to connect to again: it is
+        discarded, and the ``ConnectionError`` raised here makes the pool
+        reconnect before any command is sent.
+
+        Anything read that is not a maintenance notification or a client-side
+        cache invalidation - a reply, a null or an error reply left unread by an
+        earlier command - means the connection is dirty and is reported the same
+        way, as is a drain that does not complete within
+        ``PENDING_PUSH_NOTIFICATIONS_READ_TIMEOUT``.
+        """
+        parser = self._get_push_notifications_parser()
+        deferred: list = []
+
+        def defer(handler):
+            async def deferred_handler(notification):
+                deferred.append((handler, notification))
+
+            return deferred_handler
+
+        handlers = (
+            (parser.node_moving_push_handler_func, parser.set_node_moving_push_handler),
+            (parser.maintenance_push_handler_func, parser.set_maintenance_push_handler),
+            (
+                parser.oss_cluster_maint_push_handler_func,
+                parser.set_oss_cluster_maint_push_handler,
+            ),
+            # Client-side cache invalidations are pushes too; the ones on a
+            # connection that has to be reconnected are covered by the cache
+            # flush its disconnect performs
+            (
+                parser.invalidation_push_handler_func,
+                parser.set_invalidation_push_handler,
+            ),
+        )
+        for handler, set_handler in handlers:
+            if handler is not None:
+                set_handler(defer(handler))
+
+        alive = False
+        deadline = time.monotonic() + PENDING_PUSH_NOTIFICATIONS_READ_TIMEOUT
+        try:
+            while await self.can_read():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ConnectionError(
+                        "Timed out reading pending push notifications"
+                    )
+                read = len(deferred)
+                # The pool disconnects the connection it handed out on the error
+                try:
+                    await asyncio.wait_for(
+                        self.read_response(
+                            push_request=True, disconnect_on_error=False
+                        ),
+                        remaining,
+                    )
+                except asyncio.TimeoutError:
+                    raise ConnectionError(
+                        "Timed out reading pending push notifications"
+                    ) from None
+                # Only a push reaches a deferred handler; anything else is a
+                # reply left unread by an earlier command
+                if len(deferred) == read:
+                    raise ConnectionError("Connection has data")
+            alive = True
+        except ResponseError as e:
+            raise ConnectionError("Connection has data") from e
+        finally:
+            for handler, set_handler in handlers:
+                set_handler(handler)
+            if not alive and deferred and logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"Discarding {len(deferred)} push notification(s) buffered on "
+                    f"a connection that is closed or dirty, reconnecting: {self}"
+                )
+
+        for handler, notification in deferred:
+            try:
+                await handler(notification)
+            except Exception as e:
+                logger.error(f"Error handling {notification}: {e}")
 
     @abstractmethod
     def get_protocol(self):
@@ -707,7 +837,7 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                 self.retry = Retry(NoBackoff(), 1)
             else:
                 # deep-copy the Retry object as it is mutable
-                self.retry = copy.deepcopy(retry)
+                self.retry = copy.deepcopy(_to_async_retry(retry))
             # Update the retry's supported errors with the specified errors
             self.retry.update_supported_errors(retry_on_error)
         else:
@@ -723,6 +853,11 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         self._connect_callbacks: List[weakref.WeakMethod[ConnectCallbackT]] = []
         self._buffer_cutoff = 6000
         self._re_auth_token: Optional[TokenInterface] = None
+        self._command_packer = (
+            HiredisRespSerializer(self._pack_command_python, self.encoder.encode)
+            if HIREDIS_AVAILABLE
+            else None
+        )
         self._should_reconnect = False
 
         try:
@@ -981,6 +1116,12 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             # clean up after any error in on_connect
             await self.disconnect()
             raise
+        except BaseException:
+            # Likewise for whatever a credential provider raises and for a
+            # cancelled task. A socket left in place reads as connected, so the
+            # next command would run without AUTH and SELECT.
+            await self.disconnect(nowait=True)
+            raise
 
         # run any user callbacks. right now the only internal callback
         # is for pubsub channel/pattern resubscription
@@ -1163,6 +1304,9 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         # The server session is gone, so any HIMPORT fieldsets prepared on this
         # socket no longer exist; reset the tracking.
         self._reset_himport_state()
+        # Likewise the relaxation a maintenance applied to it: restored and
+        # reported here, ahead of a close that may time out or be skipped
+        self._complete_maintenance_on_disconnect()
         # On Python 3.13+, asyncio.timeout() raises RuntimeError when called
         # outside a running Task (e.g. during GC finalization or event-loop
         # callbacks).  In that context we fall back to a synchronous close.
@@ -1220,16 +1364,6 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             await record_connection_closed(
                 close_reason=CloseReason.APPLICATION_CLOSE,
             )
-
-        if self.maintenance_state == MaintenanceState.MAINTENANCE:
-            # MOVING state is owned by the pool-level TTL cleanup. Regular
-            # maintenance timeout relaxation can be restored when this
-            # connection closes, matching the sync lifecycle.
-            self.reset_tmp_settings(reset_relaxed_timeout=True)
-            self.maintenance_state = MaintenanceState.NONE
-            # reset the sets that keep track of received start maint
-            # notifications and skipped end maint notifications
-            self.reset_received_notifications()
 
     async def _send_ping(self):
         """Send PING, expect PONG in return"""
@@ -1292,6 +1426,11 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         except asyncio.TimeoutError as e:
             add_debug_log_for_connection_failure(self, e, "writing command")
             await self.disconnect(nowait=True)
+            if is_os_level_timeout(e):
+                # ETIMEDOUT from the OS: the connection is dead, not slow.
+                raise ConnectionError(
+                    f"Error {e.errno} while writing to socket. {e.strerror}."
+                ) from e
             raise TimeoutError("Timeout writing to socket") from None
         except OSError as e:
             add_debug_log_for_connection_failure(self, e, "writing command")
@@ -1405,6 +1544,16 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                     push_request=push_request,
                 )
         except asyncio.TimeoutError as e:
+            if is_os_level_timeout(e):
+                # The OS reported ETIMEDOUT on the socket (e.g. after a network
+                # change): the connection is dead, not slow. Returning None here
+                # made PubSub.listen() re-read the dead socket in a busy loop.
+                if disconnect_on_error:
+                    add_debug_log_for_connection_failure(self, e, "reading response")
+                    await self.disconnect(nowait=True)
+                raise ConnectionError(
+                    f"Error while reading from {host_error} : {e.args}"
+                )
             if timeout is not None:
                 # user requested timeout, return None. Operation can be retried
                 return None
@@ -1418,6 +1567,15 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
                 add_debug_log_for_connection_failure(self, e, "reading response")
                 await self.disconnect(nowait=True)
             raise ConnectionError(f"Error while reading from {host_error} : {e.args}")
+        except UNRECOVERABLE_PARSE_ERRORS as e:
+            # See the sync Connection.read_response and #4291. The async parser
+            # re-parses from self._pos = 0 rather than rewinding a socket
+            # buffer, but the consequence is the same: the bytes that already
+            # failed to parse are still there, so the connection is not
+            # reusable no matter what disconnect_on_error says.
+            add_debug_log_for_connection_failure(self, e, "reading response")
+            await self.disconnect(nowait=True)
+            raise
         except BaseException as e:
             # Also by default close in case of BaseException.  A lot of code
             # relies on this behaviour when doing Command/Response pairs.
@@ -1432,7 +1590,10 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
             self.next_health_check = next_time
 
         if isinstance(response, ResponseError):
-            raise response from None
+            try:
+                raise response from None
+            finally:
+                del response  # avoid creating ref cycles
         return response
 
     async def _read_response_from_parser(
@@ -1445,6 +1606,11 @@ class AbstractConnection(AsyncMaintNotificationsAbstractConnection):
         return await self._parser.read_response(disable_decoding=disable_decoding)
 
     def pack_command(self, *args: EncodableT) -> List[bytes]:
+        if self._command_packer is not None:
+            return self._command_packer.pack(*args)
+        return self._pack_command_python(*args)
+
+    def _pack_command_python(self, *args: EncodableT) -> List[bytes]:
         """Pack a series of arguments into the Redis protocol"""
         output = []
         # the client might have included 1 or more literal arguments in
@@ -1571,7 +1737,20 @@ class Connection(AbstractConnection):
             avoid setting additional TCP keepalive options.
         """
         self.host = host
-        self.port = int(port)
+        # bool subclasses int; port=True would become privileged port 1.
+        # Numeric strings stay valid. Callers still pass "6379".
+        if isinstance(port, bool):
+            raise TypeError("port must be an integer, not bool")
+        if isinstance(port, str):
+            try:
+                port = int(port)
+            except ValueError:
+                raise TypeError("port must be an integer, not str") from None
+        elif not isinstance(port, int):
+            raise TypeError(f"port must be an integer, not {type(port).__name__}")
+        if not 0 <= port <= 65535:
+            raise ValueError(f"port must be in 0..65535, got {port}")
+        self.port = port
         self.socket_keepalive = socket_keepalive
         if socket_keepalive_options is SENTINEL:
             socket_keepalive_options = get_default_socket_keepalive_options()
@@ -1810,13 +1989,12 @@ class UnixDomainSocketConnection(AbstractConnection):
             reader, writer = await asyncio.open_unix_connection(path=self.path)
         self._reader = reader
         self._writer = writer
-        await self.on_connect()
 
     def _host_error(self) -> str:
         return self.path
 
 
-FALSE_STRINGS = ("0", "F", "FALSE", "N", "NO")
+FALSE_STRINGS = ("0", "F", "FALSE", "N", "NO", "OFF")
 
 
 def to_bool(value) -> Optional[bool]:
@@ -2401,6 +2579,7 @@ class AsyncMaintNotificationsAbstractConnectionPool:
         Update the settings for a single connection.
         """
         if state:
+            self._complete_maintenance_taken_over_by_handoff(conn, state)
             conn.maintenance_state = state
 
         if update_notification_hash:
@@ -2420,6 +2599,33 @@ class AsyncMaintNotificationsAbstractConnectionPool:
             )
 
         conn.update_current_socket_timeout(relaxed_timeout)
+
+    def _complete_maintenance_taken_over_by_handoff(
+        self, conn: "AsyncMaintNotificationsAbstractConnection", state: MaintenanceState
+    ) -> None:
+        """
+        Report the MAINTENANCE relaxation of a connection a handoff is taking
+        over as completed. The connection's completion notification is skipped
+        while it is MOVING, and the handoff's own cleanup restores it without
+        looking at what it superseded, so this is the only point at which the
+        pair opened by the start event can be closed.
+        """
+        if (
+            state is not MaintenanceState.MOVING
+            or conn.maintenance_state is not MaintenanceState.MAINTENANCE
+            or conn.maint_notifications_config is None
+        ):
+            return
+        _dispatch_maintenance_event(
+            conn.maint_notifications_config,
+            MaintenanceCompletedEvent(
+                connection_pool=self,
+                connection=conn,
+                state=MaintenanceState.MAINTENANCE,
+                notification=None,
+                config=conn.maint_notifications_config,
+            ),
+        )
 
     async def update_connections_settings(
         self,
@@ -2563,9 +2769,7 @@ class AsyncMaintNotificationsAbstractConnectionPool:
                 f"proactive reconnect: {run_proactive_reconnect}"
             )
         async with self._get_pool_lock():
-            # Opt BlockingConnectionPool into serializing its get/release
-            # with this critical section. Other pools do not define
-            # set_in_maintenance and this is a no-op for them.
+            # Record maintenance state for pools that expose the hook.
             self._set_in_maintenance(True)
             try:
                 self._update_connections_settings_without_locking(
@@ -2648,7 +2852,7 @@ class AsyncMaintNotificationsAbstractConnectionPool:
         notification_hash: int,
         reset_relaxed_timeout: bool,
         reset_host_address: bool,
-    ) -> None:
+    ) -> bool:
         """
         Revert MOVING pool state atomically after the notification TTL.
 
@@ -2656,6 +2860,10 @@ class AsyncMaintNotificationsAbstractConnectionPool:
         up in the same critical section. Splitting the cleanup lets an
         acquire/release interleave, which can leave stale MOVING state or undo a
         newer overlapping MOVING notification.
+
+        Returns True when the pool's connection kwargs were reverted, False when
+        a newer MOVING notification had superseded this one and they were left
+        for it to revert.
         """
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -2681,6 +2889,7 @@ class AsyncMaintNotificationsAbstractConnectionPool:
                 reset_host_address=reset_host_address,
                 include_free_connections=True,
             )
+            return kwargs is not None
 
     async def _disconnect_connections(
         self, connections: Iterable["AbstractConnection"]
@@ -2767,6 +2976,10 @@ class ConnectionPool(
         arguments always win.
         """
         url_options = parse_url(url)
+
+        if "connection_class" in kwargs:
+            url_options["connection_class"] = kwargs["connection_class"]
+
         kwargs.update(url_options)
         return cls(**kwargs)
 
@@ -2780,6 +2993,10 @@ class ConnectionPool(
         max_connections = max_connections or 100
         if not isinstance(max_connections, int) or max_connections < 0:
             raise ValueError('"max_connections" must be a positive integer')
+
+        retry = connection_kwargs.get("retry")
+        if retry is not None:
+            connection_kwargs["retry"] = _to_async_retry(retry)
 
         self.connection_class = connection_class
         self._connection_kwargs = connection_kwargs
@@ -3023,9 +3240,16 @@ class ConnectionPool(
         # a command. if not, the connection was either returned to the
         # pool before all data has been read or the socket has been
         # closed. either way, reconnect and verify everything is good.
+        # With maintenance notifications enabled the pending data may be
+        # push notifications that have to be applied rather than a reason
+        # to reconnect; reading them is what tells the two apart, and it
+        # raises for a socket the server has closed in the meantime.
         try:
-            if await connection.can_read() and not self.maint_notifications_enabled():
-                raise ConnectionError("Connection has data") from None
+            if await connection.can_read():
+                if self.maint_notifications_enabled():
+                    await connection.handle_pending_push_notifications()
+                else:
+                    raise ConnectionError("Connection has data") from None
         except (ConnectionError, TimeoutError, OSError):
             await connection.disconnect()
             await connection.connect()
@@ -3105,8 +3329,10 @@ class ConnectionPool(
 
     async def aclose(self) -> None:
         """Close the pool, disconnecting all connections"""
-        await self._on_close()
-        await self.disconnect()
+        try:
+            await self._on_close()
+        finally:
+            await self.disconnect()
 
     async def __aenter__(self: _CP) -> _CP:
         return self
@@ -3115,25 +3341,40 @@ class ConnectionPool(
         await self.aclose()
 
     def set_retry(self, retry: "Retry") -> None:
+        retry = _to_async_retry(retry)
+        self.connection_kwargs["retry"] = retry
         for conn in self._available_connections:
             conn.retry = retry
         for conn in self._in_use_connections:
             conn.retry = retry
 
     async def re_auth_callback(self, token: TokenInterface):
+        first_error = None
         async with self._lock:
             for conn in self._available_connections:
-                await conn.retry.call_with_retry(
-                    lambda: conn.send_command(
-                        "AUTH", token.try_get("oid"), token.get_value()
-                    ),
-                    lambda error: self._mock(error),
-                )
-                await conn.retry.call_with_retry(
-                    lambda: conn.read_response(), lambda error: self._mock(error)
-                )
+                try:
+                    await conn.retry.call_with_retry(
+                        lambda: conn.send_command(
+                            "AUTH", token.try_get("oid"), token.get_value()
+                        ),
+                        lambda error: self._mock(error),
+                    )
+                    await conn.retry.call_with_retry(
+                        lambda: conn.read_response(),
+                        lambda error: self._mock(error),
+                        is_retryable=lambda error: not isinstance(
+                            error, AuthenticationError
+                        ),
+                    )
+                except AuthenticationError:
+                    raise
+                except Exception as e:
+                    if first_error is None:
+                        first_error = e
             for conn in self._in_use_connections:
                 conn.set_re_auth_token(token)
+        if first_error is not None:
+            raise first_error
 
     async def _mock(self, error: RedisError):
         """
@@ -3173,14 +3414,14 @@ class BlockingConnectionPool(ConnectionPool):
         >>> client = Redis.from_pool(BlockingConnectionPool())
 
     It performs the same function as the default
-    :py:class:`~redis.asyncio.ConnectionPool` implementation, in that,
+    :py:class:`~redis.asyncio.connection.ConnectionPool` implementation, in that,
     it maintains a pool of reusable connections that can be shared by
     multiple async redis clients.
 
     The difference is that, in the event that a client tries to get a
     connection from the pool when all of connections are in use, rather than
-    raising a :py:class:`~redis.ConnectionError` (as the default
-    :py:class:`~redis.asyncio.ConnectionPool` implementation does), it
+    raising a :py:class:`~redis.exceptions.MaxConnectionsError` (as the default
+    :py:class:`~redis.asyncio.connection.ConnectionPool` implementation does), it
     blocks the current `Task` for a specified number of seconds until
     a connection becomes available.
 
@@ -3218,24 +3459,13 @@ class BlockingConnectionPool(ConnectionPool):
 
     def set_in_maintenance(self, in_maintenance: bool) -> None:
         """
-        Toggle the pool's maintenance mode.
+        Record the pool's maintenance state.
 
-        While maintenance mode is on, ``get_connection`` and ``release``
-        serialize their pool mutations through ``self._lock`` so they cannot
-        interleave with a MOVING notification handler that is currently
-        rewriting pool state under the same lock. Outside of maintenance the
-        mutations skip the lock, since their critical sections are pure-Python
-        and already atomic under asyncio's single-threaded scheduling.
+        ``get_connection`` and ``release`` always serialize their pool mutations
+        through ``self._lock``, independently of this flag, so they also wait for
+        reauthentication and maintenance handlers.
         """
         self._in_maintenance = in_maintenance
-
-    @contextlib.asynccontextmanager
-    async def _maybe_pool_lock(self) -> AsyncIterator[None]:
-        if self._in_maintenance:
-            async with self._lock:
-                yield
-        else:
-            yield
 
     @deprecated_args(
         args_to_warn=["*"],
@@ -3251,7 +3481,7 @@ class BlockingConnectionPool(ConnectionPool):
             async with self._condition:
                 async with async_timeout(self.timeout):
                     await self._condition.wait_for(self.can_get_connection)
-                    async with self._maybe_pool_lock():
+                    async with self._lock:
                         # Track connection count before to detect if a new connection is created
                         connections_before = len(self._available_connections) + len(
                             self._in_use_connections
@@ -3263,7 +3493,30 @@ class BlockingConnectionPool(ConnectionPool):
                         )
                         is_created = connections_after > connections_before
         except asyncio.TimeoutError as err:
+            await record_connection_timeout(pool_name=get_pool_name(self))
             raise ConnectionError("No connection available.") from err
+
+        # Record state transition for observability.
+        pool_name = get_pool_name(self)
+        if is_created:
+            # New connection created and acquired: just USED +1
+            await record_connection_count(
+                pool_name=pool_name,
+                connection_state=ConnectionState.USED,
+                counter=1,
+            )
+        else:
+            # Existing connection acquired from pool: IDLE -> USED
+            await record_connection_count(
+                pool_name=pool_name,
+                connection_state=ConnectionState.IDLE,
+                counter=-1,
+            )
+            await record_connection_count(
+                pool_name=pool_name,
+                connection_state=ConnectionState.USED,
+                counter=1,
+            )
 
         # We now perform the connection check outside of the lock.
         try:
